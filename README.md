@@ -1,126 +1,161 @@
 # pull_docket_comments.py
 
-Download public comments for a [regulations.gov](https://www.regulations.gov) docket using the official **API v4**.
+Download public comments for a [regulations.gov](https://www.regulations.gov) document using the official **API v4**, including attachment files.
 
-This script follows the documented retrieval path: a docket contains documents; comments are listed **per document** with `filter[commentOnId]` set to that document’s **`objectId`** (not its `documentId`). Comment *text* and most submitter fields come from the comment **detail** endpoint, not the list endpoint.
+The usual way to run it is a **document ID** (repeat it for more than one document):
+
+```text
+python pull_docket_comments.py --document-id FDA-2025-N-3262-0001
+```
+
+That loads the document with `GET /v4/documents/{documentId}`, reads its `objectId`, lists comments with `filter[commentOnId]={objectId}`, then saves each comment from `GET /v4/comments/{commentId}?include=attachments` and downloads the attachment files.
+
+`--docket` is the other entry point. It lists the docket and, by default, pulls **Proposed Rule** documents only. `--all-documents` restores the old “every document in the docket” behavior. Before any comment file is downloaded, the script prints each selected document and that document’s `meta.totalElements` comment count.
 
 Official sources:
 
 - Docs: https://open.gsa.gov/api/regulationsgov/
 - OpenAPI: https://open.gsa.gov/api/regulationsgov/v4/openapi.yaml
-- API keys / default rate limits: https://api.data.gov/signup/ and https://api.data.gov/docs/developer-manual/
+- API keys: https://api.data.gov/signup/
 
-## Ontology (from official docs, not inferred product lore)
+Do not commit an API key. Set it in the shell for the session. `.env` is listed in `.gitignore`.
 
+## Quick start (Windows PowerShell)
+
+From the folder that contains this README:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+$env:REGS_API_KEY = "your-key"
+python pull_docket_comments.py --document-id FDA-2025-N-3262-0001
 ```
-Docket  ("an organizational folder containing multiple documents")
-  └── Documents  (documentType enum in OpenAPI)
-        Notice | Rule | Proposed Rule | Supporting & Related Material | Other
-          └── Comments  listed with filter[commentOnId] = document.attributes.objectId
-                └── Comment detail  GET /v4/comments/{commentId}?include=attachments
+
+If activation is blocked (`running scripts is disabled on this system`), allow local scripts for your user, then activate again:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+.\.venv\Scripts\Activate.ps1
 ```
 
-- Docket types (OpenAPI `DocketType`): `Rulemaking`, `Nonrulemaking`.
-- The narrative API description lists document types as “Proposed Rule, Rule, Supporting & Related, or Other.” The OpenAPI `DocumentType` enum also includes **`Notice`** and spells the supporting type **`Supporting & Related Material`**. The script accepts whatever `documentType` the API returns.
-- Comments are **not** listed with `filter[docketId]`. That filter exists on `/v4/documents`, not on `/v4/comments` (OpenAPI). The documented examples first list documents for the docket, then list comments for each document’s `objectId`.
-- A comment **detail** record does carry `docketId` (docs: always publicly viewable). That tells you which docket the comment belongs to. This research did **not** find a documented API to list comments “on the docket itself” (for example using the docket’s `objectId` as `commentOnId`).
-- List vs detail: the OpenAPI list schema (`Comment`) has identifiers, dates, and title — not the comment body. The detail schema (`CommentDetail` / `BasicDetailModel`) includes `comment` text, `receiveDate`, `commentOnDocumentId`, and agency-configurable submitter fields (`firstName`, `lastName`, `organization`, and others). Agencies can hide some of those fields.
-- Attachments: not included by default. Pass `include=attachments` on the detail endpoint. Files are described as `fileFormats[]` with `fileUrl` (OpenAPI: “URL of the file on S3”), `format`, and `size`.
+Small test run (five new comment details, then stop). Already-saved comments are skipped, so you can rerun the same command to continue:
 
-Pagination (OpenAPI, same for documents/comments/dockets): `page[size]` 5–250, `page[number]` 1–20 (at most 5,000 rows per query). For more than 5,000 comments, official examples sort `lastModifiedDate,documentId` and continue with `filter[lastModifiedDate][ge]=…` (format `yyyy-MM-dd HH:mm:ss`, illustrated in Eastern time). Official FAQ: that `lastModifiedDate` parameter is **beta** and may be removed when a permanent bulk download exists. There is no official bulk-download API today.
+```powershell
+python pull_docket_comments.py --document-id FDA-2025-N-3262-0001 --max-comments 5
+```
 
-## Test / staging environment
+More than one document:
 
-The official FAQ (“What is the staging API url?”) says:
+```powershell
+python pull_docket_comments.py --document-id FDA-2025-N-3262-0001 --document-id FDA-2025-N-3262-0002
+```
 
-> Users should be able to access our staging API at https://api-staging.regulations.gov. Please use this environment for testing purposes.
+Proposed Rules in a docket, or every document type:
 
-It does **not** say the staging API is keyless. Direct checks (15 November 2026, America/Chicago) found:
+```powershell
+python pull_docket_comments.py --docket FDA-2025-N-3262
+python pull_docket_comments.py --docket FDA-2025-N-3262 --all-documents
+```
 
-- No API key → HTTP 403, `API_KEY_MISSING` (“No api_key was supplied”).
-- `DEMO_KEY` (header or `api_key` query) → HTTP 503, body `no healthy upstream` (staging was not healthy at test time).
-- Staging `DEMO_KEY` responses included `X-RateLimit-Limit: 10` (stricter than production defaults documented for api.data.gov).
+Output goes to `out-FDA-2025-N-3262` (the document’s docket id, or `--docket` when you pass it). `comments.csv` is UTF-8 with a BOM so Excel opens it correctly.
 
-Use `--base-url https://api-staging.regulations.gov/v4` only when staging is up **and** you have a key that staging accepts. For exploration of production data, use the default base URL and a key.
+## Command Prompt
 
-## DEMO_KEY
+```bat
+py -m venv .venv
+.venv\Scripts\activate.bat
+pip install -r requirements.txt
+set REGS_API_KEY=your-key
+python pull_docket_comments.py --document-id FDA-2025-N-3262-0001
+```
 
-Official docs: you may send `DEMO_KEY` in `X-Api-Key` “for sample purposes,” and “should only be used for demonstration purposes… not… for anything more than exploring our APIs.”
+Test run:
 
-api.data.gov default limits (https://api.data.gov/docs/developer-manual/):
+```bat
+python pull_docket_comments.py --document-id FDA-2025-N-3262-0001 --max-comments 5
+```
 
-- Personal key: 1,000 requests per hour (rolling window), across all api.data.gov APIs for that key.
-- `DEMO_KEY`: **30 requests per IP per hour** and **50 per IP per day**.
-- Over limit: HTTP 429. Inspect `X-RateLimit-Limit` and `X-RateLimit-Remaining`.
-
-The script defaults to `DEMO_KEY` if `REGS_API_KEY` is unset, prints a warning, and backs off on 429 / low remaining counts. If a 429 includes a `Retry-After` of more than 180 seconds (quota reset, sometimes several hours), the script stops with an error instead of sleeping that long; rerun the same `--out` after the window resets (already-saved files are skipped).
-
-Observed during a 15 November 2026 (America/Chicago) `DEMO_KEY` test against production: responses advertised `X-RateLimit-Limit: 10` (not the documented 30/hour), and once remaining hit 0 a subsequent request returned HTTP 429 with `Retry-After` of 25921 seconds (~7.2 hours). Treat the documented 30/hour and 50/day figures as the official policy, but also honor the headers you actually receive.
-
-For a real docket pull, set your own key:
+## macOS / Linux
 
 ```bash
-export REGS_API_KEY='your-api.data.gov-key'
-```
-
-Signup: https://api.data.gov/signup/ (also embedded on the official regulations.gov API docs page).
-
-## Install
-
-```bash
-cd /workspace/regs_comments
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+export REGS_API_KEY='your-key'
+python pull_docket_comments.py --document-id FDA-2025-N-3262-0001
 ```
 
-## Usage
+Test run:
 
 ```bash
-# Explore with DEMO_KEY (low limits). Cap detail fetches for a dry run:
-python pull_docket_comments.py \
-  --docket FDA-2025-N-3262 \
-  --out ./out-fda-2025-n-3262 \
-  --max-comments 3 \
-  --max-attachments 1
-
-# Production pull with your key (downloads all comment details and attachments):
-export REGS_API_KEY='your-key'
-python pull_docket_comments.py \
-  --docket FDA-2025-N-3262 \
-  --out ./out-fda-2025-n-3262
-
-# If staging is healthy and your key works there:
-python pull_docket_comments.py \
-  --docket FDA-2025-N-3262 \
-  --base-url https://api-staging.regulations.gov/v4 \
-  --out ./out-staging \
-  --max-comments 3
+python pull_docket_comments.py --document-id FDA-2025-N-3262-0001 --max-comments 5
 ```
+
+`tzdata` (in `requirements.txt`) supplies the Eastern-time database Windows needs when a document has more than 5,000 comments. On macOS and Linux the system timezone data is used as well.
+
+## Flags
 
 | Flag | Meaning |
 | --- | --- |
-| `--docket` | Required docket ID, e.g. `FDA-2025-N-3262` |
-| `--base-url` | API root, default `https://api.regulations.gov/v4` |
-| `--out` | Output directory, default `./out-<docket>` |
-| `--no-attachments` | Do not request or download attachments |
-| `--max-comments` | Stop after this many *new* comment-detail fetches (already-saved comments are skipped). Useful with `DEMO_KEY`. |
-| `--max-attachments` | Stop downloading files after this many attachments (details are still saved). |
-| `--document-id` | Repeatable. Only look up comments for these document IDs (all documents are still listed). |
-| `--open-for-comment-only` | Only look up comments on documents with `openForComment=true`. Use with `DEMO_KEY` to avoid one list call per supporting document. |
+| `--document-id` | Document ID, e.g. `FDA-2025-N-3262-0001`. Repeat the flag for another document. This is the primary way to run the script. |
+| `--docket` | Docket ID, e.g. `FDA-2025-N-3262`. Pulls Proposed Rule documents only, unless `--all-documents` is set. Optional when `--document-id` is given. |
+| `--all-documents` | With `--docket`, pull every document type (Supporting & Related Material, Other, and the rest). |
+| `--base-url` | API root. Default `https://api.regulations.gov/v4`. |
+| `--out` | Output directory. Default `./out-<docket>`. |
+| `--no-attachments` | Do not request or download attachments. |
+| `--max-comments` | Stop after this many *new* comment-detail fetches. Already-saved comments are skipped. |
+| `--max-attachments` | Stop downloading files after this many attachments. Details are still saved. |
+| `--open-for-comment-only` | Only pull documents with `openForComment=true`. |
 
-The run is **resumable**: comment JSON already present under `raw/` is not fetched again. Re-run the same `--out` after a rate-limit pause or with a production key to continue.
+The run is **resumable**. Comment JSON already under `raw/` is not fetched again, and attachment files that are already on disk are skipped. Re-run the same `--out` after a rate-limit pause.
 
 ## Output
 
-```
+```text
 <out>/
-  docket.json           # GET /dockets/{id}
-  documents.json        # all listed documents (id, type, objectId, title, …)
-  comment_counts.json   # per-document comment totals from list metadata
-  comments.csv          # one row per fetched comment detail
-  raw/<commentId>.json  # full detail JSON
-  attachments/<commentId>/…
+  docket.json
+  documents.json
+  comment_counts.json          # one totalElements per selected document
+  comments.csv                  # UTF-8 BOM, one row per saved comment
+  raw/<commentId>.json
+  attachments/<commentId>/...
 ```
 
 `comments.csv` columns: `id`, `documentId` (parent document / `commentOnDocumentId`), `title`, `postedDate`, `receiveDate`, `firstName`, `lastName`, `organization`, `comment`, `attachmentCount`.
+
+File names are rewritten so Windows accepts them (`:` `*` `?` `"` `<` `>` `|` and other illegal characters are removed, reserved names such as `CON` are avoided, and very long paths are shortened).
+
+## How comments are found
+
+```text
+Docket
+  └── Documents
+        Notice | Rule | Proposed Rule | Supporting & Related Material | Other
+          └── Comments  filter[commentOnId] = document.attributes.objectId
+                └── Comment detail  GET /v4/comments/{commentId}?include=attachments
+```
+
+- `--document-id` does not list the rest of the docket. It loads that document and uses its `objectId`.
+- `--docket` lists documents, keeps `documentType` **Proposed Rule**, and prints each one’s comment total before downloading. `--all-documents` keeps every type.
+- Comments are not listed with `filter[docketId]`. That filter is on `/v4/documents`, not `/v4/comments`.
+- The list payload has identifiers, dates, and title. The comment text and submitter fields are on the detail record. Agencies can hide some submitter fields.
+- Attachments are omitted unless `include=attachments` is set. Files are `fileFormats[]` with `fileUrl`, `format`, and `size`.
+
+Pagination is the same for documents and comments: `page[size]` 5–250 and `page[number]` 1–20 (at most 5,000 rows per query). For more than 5,000 comments the script sorts `lastModifiedDate,documentId` and continues with `filter[lastModifiedDate][ge]` (`yyyy-MM-dd HH:mm:ss` in Eastern time), which is the documented approach. That parameter is beta and may be removed when a bulk download exists.
+
+## API key and DEMO_KEY
+
+With no `REGS_API_KEY`, the script sends `DEMO_KEY` and prints a warning. Official api.data.gov limits for `DEMO_KEY` are 30 requests per IP per hour and 50 per IP per day. A full docket is larger than that. Use your own key for a real pull.
+
+Personal keys are 1,000 requests per hour (rolling window). HTTP 429 means the limit was hit. The script reads `Retry-After`. If that wait is longer than 180 seconds it stops instead of sleeping for hours; rerun the same `--out` after the window resets.
+
+Signup: https://api.data.gov/signup/
+
+## Tests
+
+Offline checks (no API key and no network):
+
+```bash
+python -m unittest discover -s tests -v
+```

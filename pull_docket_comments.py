@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""Pull public comments for a regulations.gov docket via official API v4.
+"""Pull public comments for a regulations.gov document via official API v4.
 
-Documented flow (https://open.gsa.gov/api/regulationsgov/):
-  1. GET /v4/dockets/{docketId}
-  2. GET /v4/documents?filter[docketId]={docketId}  (paginate)
-  3. For each document, GET /v4/comments?filter[commentOnId]={objectId}
-     with page[size]=250, pages 1-20; if more than 5000 comments, continue
-     with sort=lastModifiedDate,documentId and filter[lastModifiedDate][ge]=...
-  4. GET /v4/comments/{commentId}?include=attachments for text and files.
+Primary path (one or more document IDs):
+  1. GET /v4/documents/{documentId} and read attributes.objectId
+  2. GET /v4/comments?filter[commentOnId]={objectId}
+     page[size]=250, pages 1-20; if more than 5000 comments, continue with
+     sort=lastModifiedDate,documentId and filter[lastModifiedDate][ge]=...
+  3. GET /v4/comments/{commentId}?include=attachments for text and files
+
+Docket path (--docket, no --document-id):
+  list documents, keep documentType "Proposed Rule" unless --all-documents,
+  then the same comment steps. Comment totals are printed before downloads.
 
 List endpoints do not include comment body; detail does (OpenAPI Comment vs
 CommentDetail). commentOnId is the parent document's objectId, not documentId.
+Docs: https://open.gsa.gov/api/regulationsgov/
 """
 
 from __future__ import annotations
@@ -26,7 +30,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
@@ -54,6 +58,21 @@ CSV_COLUMNS = [
 
 log = logging.getLogger("pull_docket_comments")
 
+# Windows forbids <>:"/\|?* and ASCII controls in file names, plus trailing
+# dots/spaces and device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9).
+_FORBIDDEN_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_WINDOWS_RESERVED = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+PROPOSED_RULE = "Proposed Rule"
+# Stay under the legacy Windows MAX_PATH (260) with room for a ".part" suffix.
+MAX_PATH_LEN = 230
+
 
 def eastern_filter_value(iso_value: str) -> str:
     """Convert an ISO-8601 lastModifiedDate to the official filter format.
@@ -70,11 +89,88 @@ def eastern_filter_value(iso_value: str) -> str:
     return dt.astimezone(EASTERN).strftime(LAST_MOD_FILTER_FMT)
 
 
-def safe_filename(name: str) -> str:
-    name = name.strip() or "file"
-    name = name.replace("\\", "_").replace("/", "_")
-    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
-    return name[:180]
+def safe_filename(name: str, *, max_len: int = 120) -> str:
+    """Return one path segment that is legal on Windows and POSIX.
+
+    Characters Windows forbids (<>:"/\\|?* and control characters) are
+    replaced. Unicode letters, spaces, and other allowed punctuation stay.
+    """
+    text = _FORBIDDEN_CHARS.sub("_", str(name or ""))
+    text = re.sub(r"_+", "_", text)
+    text = re.sub(r"\s+", " ", text).strip(" ._")
+    if not text or text in {".", ".."}:
+        text = "file"
+    stem = text.split(".", 1)[0].upper()
+    if stem in _WINDOWS_RESERVED:
+        text = f"_{text}"
+    max_len = max(12, max_len)
+    if len(text) > max_len:
+        dot = text.rfind(".")
+        if 0 < dot < len(text) - 1:
+            ext = text[dot + 1 :][:20]
+            keep = max_len - len(ext) - 1
+            root = text[:dot].strip(" .") or "file"
+            text = root[:max_len] if keep < 1 else f"{root[:keep]}.{ext}"
+        else:
+            text = text[:max_len]
+        text = text.rstrip(" ._") or "file"
+        if text.split(".", 1)[0].upper() in _WINDOWS_RESERVED:
+            text = f"_{text}"
+    return text
+
+
+def destination_path(directory: Path, filename: str, *, max_path: int = MAX_PATH_LEN) -> Path:
+    """Join directory and filename, shortening the name if the full path is long."""
+    directory = Path(directory)
+    name = safe_filename(filename)
+    dest = directory / name
+
+    def length_of(path: Path) -> int:
+        try:
+            return len(str(path.resolve()))
+        except OSError:
+            return len(str(path))
+
+    extra = length_of(dest) - max_path
+    if extra <= 0:
+        return dest
+    shortened = safe_filename(name, max_len=max(12, len(name) - extra))
+    dest = directory / shortened
+    if length_of(dest) > max_path:
+        log.warning("Path is still long (%s characters): %s", length_of(dest), dest)
+    return dest
+
+
+def unique_filename(filename: str, used: set[str]) -> str:
+    """Pick a deterministic unused name. `used` stores lowercased names."""
+    candidate = safe_filename(filename)
+    dot = candidate.rfind(".")
+    if 0 < dot < len(candidate) - 1:
+        root, ext = candidate[:dot], candidate[dot:]
+    else:
+        root, ext = candidate, ""
+    number = 2
+    while candidate.lower() in used:
+        candidate = safe_filename(f"{root}-{number}{ext}")
+        number += 1
+        if number > 9999:
+            break
+    return candidate
+
+
+def attachment_basename(fmt: dict[str, Any], index: int) -> str:
+    """Basename from a fileUrl, without using pathlib (Windows treats ':' specially)."""
+    url = str(fmt.get("fileUrl") or "")
+    tail = unquote(urlparse(url).path.rsplit("/", 1)[-1]).strip()
+    base = tail or f"attachment-{index}"
+    ext = str(fmt.get("format") or "").strip().lstrip(".").lower()
+    if ext and not base.lower().endswith("." + ext):
+        base = f"{base}.{ext}"
+    return base
+
+
+def api_segment(value: str) -> str:
+    return quote(str(value), safe="-._")
 
 
 class RegulationsClient:
@@ -206,10 +302,14 @@ class RegulationsClient:
 
     def download(self, url: str, dest: Path) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dest.with_suffix(dest.suffix + ".part")
+        # Keep the original suffix. Path.with_suffix would replace ".tar.gz"
+        # with a single suffix and is easier to get wrong on Windows.
+        tmp = dest.parent / (dest.name + ".part")
         resp = self.request("GET", url, stream=True)
         if not resp.ok:
-            raise RuntimeError(f"Download {url} failed: {resp.status_code}")
+            status = resp.status_code
+            resp.close()
+            raise RuntimeError(f"Download {url} failed: {status}")
         try:
             with tmp.open("wb") as fh:
                 for chunk in resp.iter_content(chunk_size=1024 * 64):
@@ -228,6 +328,7 @@ def paginate_collection(
     base_params: dict[str, Any],
     *,
     label: str,
+    seed: tuple[list[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Yield unique items, paging 250 x 20 then lastModifiedDate windows.
 
@@ -236,6 +337,9 @@ def paginate_collection(
       page[size]=250, page[number]=1..20
       then filter[lastModifiedDate][ge] = last record's timestamp
       (yyyy-MM-dd HH:mm:ss, Eastern in the documented example).
+
+    `seed` is an already-fetched page 1 (items, meta) so a totals lookup is
+    not requested again.
     """
     seen: set[str] = set()
     window_ge: str | None = None
@@ -249,17 +353,20 @@ def paginate_collection(
         first_meta: dict[str, Any] | None = None
 
         for page in range(1, MAX_PAGE + 1):
-            params = {
-                **base_params,
-                "page[size]": PAGE_SIZE,
-                "page[number]": page,
-                "sort": "lastModifiedDate,documentId",
-            }
-            if window_ge:
-                params["filter[lastModifiedDate][ge]"] = window_ge
-            payload = client.get_json(path, params)
-            items = payload.get("data") or []
-            meta = payload.get("meta") or {}
+            if seed is not None and window == 1 and page == 1:
+                items, meta = seed
+            else:
+                params = {
+                    **base_params,
+                    "page[size]": PAGE_SIZE,
+                    "page[number]": page,
+                    "sort": "lastModifiedDate,documentId",
+                }
+                if window_ge:
+                    params["filter[lastModifiedDate][ge]"] = window_ge
+                payload = client.get_json(path, params)
+                items = payload.get("data") or []
+                meta = payload.get("meta") or {}
             if first_meta is None:
                 first_meta = meta
                 log.info(
@@ -375,9 +482,17 @@ def comment_row(detail: dict[str, Any], attachment_count: int) -> dict[str, Any]
     }
 
 
-def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as fh:
+    with path.open("w", encoding="utf-8", newline="\n") as fh:
+        json.dump(payload, fh, indent=2)
+        fh.write("\n")
+
+
+def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    """UTF-8 with BOM so Excel on Windows opens the file as Unicode."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8-sig") as fh:
         writer = csv.DictWriter(fh, fieldnames=CSV_COLUMNS, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
@@ -396,17 +511,334 @@ def rebuild_csv_from_raw(out_dir: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def doc_attrs(doc: dict[str, Any]) -> dict[str, Any]:
+    attrs = doc.get("attributes") or {}
+    return attrs if isinstance(attrs, dict) else {}
+
+
+def is_proposed_rule(doc: dict[str, Any]) -> bool:
+    return str(doc_attrs(doc).get("documentType") or "").strip().casefold() == PROPOSED_RULE.casefold()
+
+
+def describe_types(documents: list[dict[str, Any]]) -> str:
+    counts: dict[str, int] = {}
+    for doc in documents:
+        label = str(doc_attrs(doc).get("documentType") or "unknown")
+        counts[label] = counts.get(label, 0) + 1
+    if not counts:
+        return "none"
+    parts = [f"{count} {name}" for name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))]
+    return ", ".join(parts)
+
+
+def as_int(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def page_covers_all(items: list[dict[str, Any]], meta: dict[str, Any]) -> bool:
+    """True when page 1 already holds every row (no further comment pages)."""
+    total = as_int(meta.get("totalElements"))
+    if not items:
+        return total in (None, 0)
+    if meta.get("lastPage") is True or meta.get("hasNextPage") is False:
+        return True
+    total_pages = as_int(meta.get("totalPages"))
+    if total is not None and len(items) >= total:
+        return True
+    if total_pages is not None and total_pages <= 1:
+        return True
+    return False
+
+
+def dedupe_ids(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered
+
+
+def fetch_document(client: RegulationsClient, document_id: str) -> dict[str, Any]:
+    path = f"/documents/{api_segment(document_id)}"
+    try:
+        payload = client.get_json(path)
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"Document {document_id} was not found (GET /v4/documents/{document_id})."
+        ) from None
+    data = payload.get("data")
+    if isinstance(data, list):
+        data = data[0] if data else None
+    if not isinstance(data, dict) or not data.get("id"):
+        raise RuntimeError(f"Unexpected response for GET /v4/documents/{document_id}")
+    return data
+
+
+def choose_out_dir(args: argparse.Namespace, documents: list[dict[str, Any]]) -> Path:
+    if args.out:
+        return Path(args.out)
+    if args.docket:
+        return Path("out-" + safe_filename(args.docket))
+    docket_ids: list[str] = []
+    for doc in documents:
+        docket_id = str(doc_attrs(doc).get("docketId") or "")
+        if docket_id and docket_id not in docket_ids:
+            docket_ids.append(docket_id)
+    if len(docket_ids) == 1:
+        return Path("out-" + safe_filename(docket_ids[0]))
+    if len(documents) == 1 and documents[0].get("id"):
+        return Path("out-" + safe_filename(str(documents[0]["id"])))
+    return Path("out-comments")
+
+
+def save_dockets(client: RegulationsClient, out_dir: Path, docket_ids: list[str]) -> None:
+    saved: list[tuple[str, dict[str, Any]]] = []
+    for docket_id in docket_ids:
+        log.info("Fetching docket %s", docket_id)
+        try:
+            payload = client.get_json(f"/dockets/{api_segment(docket_id)}")
+        except FileNotFoundError:
+            log.warning("Docket %s was not found; continuing without docket metadata", docket_id)
+            continue
+        attrs = (payload.get("data") or {}).get("attributes") or {}
+        log.info(
+            "Docket title=%r type=%s agency=%s",
+            attrs.get("title") or attrs.get("shortTitle"),
+            attrs.get("docketType"),
+            attrs.get("agencyId"),
+        )
+        saved.append((docket_id, payload))
+    if len(saved) == 1:
+        write_json(out_dir / "docket.json", saved[0][1])
+        return
+    for docket_id, payload in saved:
+        write_json(out_dir / f"docket-{safe_filename(docket_id)}.json", payload)
+
+
+def docket_ids_for(args: argparse.Namespace, documents: list[dict[str, Any]]) -> list[str]:
+    found: list[str] = []
+    if args.docket:
+        found.append(args.docket)
+    for doc in documents:
+        docket_id = str(doc_attrs(doc).get("docketId") or "")
+        if docket_id and docket_id not in found:
+            found.append(docket_id)
+    return found
+
+
+def select_documents(
+    client: RegulationsClient, args: argparse.Namespace
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return (every document we learned about, documents whose comments we will pull)."""
+    if args.document_ids and args.all_documents:
+        log.warning("--all-documents has no effect when --document-id is used")
+
+    if args.document_ids:
+        log.info(
+            "Resolving %s document id(s) via GET /v4/documents/{id}",
+            len(args.document_ids),
+        )
+        fetched: list[dict[str, Any]] = []
+        for document_id in args.document_ids:
+            doc = fetch_document(client, document_id)
+            attrs = doc_attrs(doc)
+            log.info(
+                "  %s | %s | docket=%s | objectId=%s | %s",
+                doc.get("id"),
+                attrs.get("documentType"),
+                attrs.get("docketId"),
+                attrs.get("objectId"),
+                attrs.get("title"),
+            )
+            docket_id = str(attrs.get("docketId") or "")
+            if args.docket and docket_id and docket_id != args.docket:
+                raise RuntimeError(
+                    f"Document {doc.get('id')} is in docket {docket_id}, not {args.docket}."
+                )
+            fetched.append(doc)
+        selected = filter_open_for_comment(fetched, args.open_for_comment_only)
+        return fetched, selected
+
+    log.info("Listing documents for docket %s", args.docket)
+    listed = list(
+        paginate_collection(
+            client,
+            "/documents",
+            {"filter[docketId]": args.docket},
+            label=f"documents[{args.docket}]",
+        )
+    )
+    log.info(
+        "Docket %s has %s document(s): %s",
+        args.docket,
+        len(listed),
+        describe_types(listed),
+    )
+    if not listed:
+        log.warning("No documents found for this docket.")
+    if args.all_documents:
+        candidates = list(listed)
+        log.info("--all-documents: pulling every document type (%s)", len(candidates))
+    else:
+        candidates = [doc for doc in listed if is_proposed_rule(doc)]
+        log.info(
+            "Pulling Proposed Rule documents only (%s of %s). "
+            "Pass --all-documents to include every type, or pass --document-id for a specific document.",
+            len(candidates),
+            len(listed),
+        )
+    return listed, filter_open_for_comment(candidates, args.open_for_comment_only)
+
+
+def filter_open_for_comment(
+    documents: list[dict[str, Any]], open_only: bool
+) -> list[dict[str, Any]]:
+    if not open_only:
+        return list(documents)
+    selected: list[dict[str, Any]] = []
+    for doc in documents:
+        if doc_attrs(doc).get("openForComment"):
+            selected.append(doc)
+            continue
+        log.info(
+            "Skipping %s (openForComment=%s)",
+            doc.get("id"),
+            doc_attrs(doc).get("openForComment"),
+        )
+    return selected
+
+
+def comment_plan(client: RegulationsClient, doc: dict[str, Any]) -> dict[str, Any]:
+    attrs = doc_attrs(doc)
+    document_id = doc.get("id")
+    object_id = attrs.get("objectId")
+    plan: dict[str, Any] = {
+        "documentId": document_id,
+        "documentType": attrs.get("documentType"),
+        "objectId": object_id,
+        "title": attrs.get("title"),
+        "openForComment": attrs.get("openForComment"),
+        "totalElements": None,
+        "first_items": [],
+        "meta": {},
+        "note": None,
+    }
+    if not object_id:
+        plan["note"] = "missing objectId"
+        log.warning("Document %s has no objectId; its comments cannot be listed", document_id)
+        return plan
+    items, meta = first_page_meta(client, "/comments", {"filter[commentOnId]": object_id})
+    plan["first_items"] = items
+    plan["meta"] = meta
+    plan["totalElements"] = meta.get("totalElements")
+    return plan
+
+
+def public_count(plan: dict[str, Any]) -> dict[str, Any]:
+    row = {
+        "documentId": plan.get("documentId"),
+        "documentType": plan.get("documentType"),
+        "objectId": plan.get("objectId"),
+        "title": plan.get("title"),
+        "totalElements": plan.get("totalElements"),
+        "openForComment": plan.get("openForComment"),
+    }
+    if plan.get("note"):
+        row["note"] = plan["note"]
+    return row
+
+
+def announce_plan(plans: list[dict[str, Any]]) -> None:
+    log.info(
+        "Will pull comments for %s document(s). "
+        "Totals below are meta.totalElements; downloads start after this list:",
+        len(plans),
+    )
+    if not plans:
+        log.info("  (no documents)")
+        return
+    known_total = 0
+    all_known = True
+    for plan in plans:
+        count = plan.get("totalElements")
+        count_int = as_int(count)
+        if count_int is None:
+            all_known = False
+            count_text = "unknown" if count is None else str(count)
+        else:
+            known_total += count_int
+            count_text = str(count_int)
+        note = f" ({plan['note']})" if plan.get("note") else ""
+        log.info(
+            "  %s | %s | totalElements=%s | objectId=%s | %s%s",
+            plan.get("documentId"),
+            plan.get("documentType"),
+            count_text,
+            plan.get("objectId"),
+            plan.get("title") or "",
+            note,
+        )
+    if plans and all_known:
+        log.info("Sum of totalElements=%s", known_total)
+
+
+def iter_comment_items(client: RegulationsClient, plan: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    document_id = plan.get("documentId")
+    object_id = plan.get("objectId")
+    items = plan.get("first_items") or []
+    meta = plan.get("meta") or {}
+    if not object_id:
+        return
+    label = f"comments[{document_id}]"
+    params = {"filter[commentOnId]": object_id}
+    if not items and as_int(meta.get("totalElements")) not in (None, 0):
+        log.warning(
+            "Page 1 for %s was empty but totalElements=%s; listing from scratch",
+            document_id,
+            meta.get("totalElements"),
+        )
+        yield from paginate_collection(client, "/comments", params, label=label)
+        return
+    if page_covers_all(items, meta):
+        yield from items
+        return
+    yield from paginate_collection(client, "/comments", params, label=label, seed=(items, meta))
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download regulations.gov comments for a docket (API v4)."
+        description=(
+            "Download regulations.gov comments for a document or docket (API v4). "
+            "The primary way to run this is --document-id."
+        )
     )
-    parser.add_argument("--docket", required=True, help="Docket ID, e.g. FDA-2025-N-3262")
+    parser.add_argument(
+        "--docket",
+        default=None,
+        help=(
+            "Docket ID, e.g. FDA-2025-N-3262. Pulls Proposed Rule documents only "
+            "unless --all-documents is set. Optional when --document-id is given."
+        ),
+    )
     parser.add_argument(
         "--base-url",
         default=DEFAULT_BASE_URL,
         help=f"API root (default: {DEFAULT_BASE_URL}). Staging: https://api-staging.regulations.gov/v4",
     )
-    parser.add_argument("--out", default=None, help="Output directory (default: ./out-<docket>)")
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="Output directory (default: ./out-<docket>, from --docket or the document's docketId)",
+    )
     parser.add_argument(
         "--no-attachments",
         action="store_true",
@@ -429,186 +861,77 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="append",
         default=None,
         dest="document_ids",
-        help="Only process this document ID (repeatable). Still lists all documents.",
+        metavar="DOCUMENT_ID",
+        help=(
+            "Document ID to pull, e.g. FDA-2025-N-3262-0001 (repeatable). "
+            "Resolved with GET /v4/documents/{id}; comments and attachments for "
+            "that document are downloaded. This is the primary way to run the script."
+        ),
+    )
+    parser.add_argument(
+        "--all-documents",
+        action="store_true",
+        help="With --docket, pull every document type. The default is Proposed Rule only.",
     )
     parser.add_argument(
         "--open-for-comment-only",
         action="store_true",
-        help="Only list/count comments on documents with openForComment=true "
-        "(saves rate limit; other documents are still listed).",
+        help="Only pull documents with openForComment=true.",
     )
-    return parser.parse_args(argv)
-
-
-def main(argv: list[str] | None = None) -> int:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+    args = parser.parse_args(argv)
+    if args.docket:
+        args.docket = args.docket.strip() or None
+    args.document_ids = dedupe_ids(
+        [item.strip() for item in (args.document_ids or []) if item and item.strip()]
     )
-    args = parse_args(argv)
-    api_key = os.environ.get("REGS_API_KEY", "").strip() or DEFAULT_KEY
-    if api_key == DEFAULT_KEY:
-        log.warning(
-            "REGS_API_KEY is unset; using DEMO_KEY. Official docs say DEMO_KEY is "
-            "for exploring the API only. api.data.gov limits DEMO_KEY to 30 "
-            "requests/IP/hour and 50/IP/day. Set REGS_API_KEY for a real pull."
-        )
+    if not args.docket and not args.document_ids:
+        parser.error("provide --document-id and/or --docket")
+    return args
 
-    out_dir = Path(args.out or f"./out-{args.docket}").resolve()
+
+def run(args: argparse.Namespace, client: RegulationsClient) -> int:
+    listed, selected = select_documents(client, args)
+    out_dir = choose_out_dir(args, selected or listed).resolve()
     raw_dir = out_dir / "raw"
     attach_root = out_dir / "attachments"
     raw_dir.mkdir(parents=True, exist_ok=True)
-
-    client = RegulationsClient(args.base_url, api_key)
-    log.info("Base URL: %s", client.base_url)
     log.info("Output:   %s", out_dir)
 
-    # --- Docket ---
-    log.info("Fetching docket %s", args.docket)
-    docket = client.get_json(f"/dockets/{args.docket}")
-    (out_dir / "docket.json").write_text(json.dumps(docket, indent=2), encoding="utf-8")
-    docket_attrs = (docket.get("data") or {}).get("attributes") or {}
-    log.info(
-        "Docket title=%r type=%s agency=%s",
-        docket_attrs.get("title") or docket_attrs.get("shortTitle"),
-        docket_attrs.get("docketType"),
-        docket_attrs.get("agencyId"),
-    )
+    save_dockets(client, out_dir, docket_ids_for(args, selected or listed))
+    write_json(out_dir / "documents.json", listed)
 
-    # --- Documents ---
-    log.info("Listing documents for docket %s", args.docket)
-    documents = list(
-        paginate_collection(
-            client,
-            "/documents",
-            {"filter[docketId]": args.docket},
-            label=f"documents[{args.docket}]",
-        )
-    )
-    (out_dir / "documents.json").write_text(
-        json.dumps(documents, indent=2), encoding="utf-8"
-    )
-    for doc in documents:
-        attrs = doc.get("attributes") or {}
-        log.info(
-            "  document id=%s type=%s objectId=%s openForComment=%s title=%r",
-            doc.get("id"),
-            attrs.get("documentType"),
-            attrs.get("objectId"),
-            attrs.get("openForComment"),
-            attrs.get("title"),
-        )
-    if not documents:
-        log.warning("No documents found for this docket.")
+    log.info("Reading per-document comment totals before any download")
+    plans = [comment_plan(client, doc) for doc in selected]
+    announce_plan(plans)
+    write_json(out_dir / "comment_counts.json", [public_count(plan) for plan in plans])
 
-    # --- Comment counts + IDs ---
-    counts: list[dict[str, Any]] = []
     comment_ids: list[str] = []
     seen_comment_ids: set[str] = set()
     stop_listing = False
 
-    wanted_ids = set(args.document_ids or [])
-    for doc in documents:
-        attrs = doc.get("attributes") or {}
-        object_id = attrs.get("objectId")
-        doc_id = doc.get("id")
-        if wanted_ids and doc_id not in wanted_ids:
-            log.info("Skipping comment lookup for %s (--document-id filter)", doc_id)
-            continue
-        if args.open_for_comment_only and not attrs.get("openForComment"):
-            log.info(
-                "Skipping comment lookup for %s (openForComment=%s)",
-                doc_id,
-                attrs.get("openForComment"),
-            )
-            continue
-        if not object_id:
-            log.warning("Document %s has no objectId; skipping comment listing", doc_id)
-            counts.append(
-                {
-                    "documentId": doc_id,
-                    "documentType": attrs.get("documentType"),
-                    "objectId": None,
-                    "title": attrs.get("title"),
-                    "totalElements": None,
-                    "note": "missing objectId",
-                }
-            )
-            continue
+    def consider(item: dict[str, Any]) -> None:
+        cid = item.get("id")
+        if not cid or str(cid) in seen_comment_ids:
+            return
+        seen_comment_ids.add(str(cid))
+        comment_ids.append(str(cid))
 
-        # Always take page 1 to read totalElements (official large-docket example).
-        first_items, meta = first_page_meta(
-            client, "/comments", {"filter[commentOnId]": object_id}
-        )
-        total = meta.get("totalElements")
-        counts.append(
-            {
-                "documentId": doc_id,
-                "documentType": attrs.get("documentType"),
-                "objectId": object_id,
-                "title": attrs.get("title"),
-                "totalElements": total,
-                "openForComment": attrs.get("openForComment"),
-            }
-        )
-        log.info(
-            "  comments on %s (%s, objectId=%s): totalElements=%s",
-            doc_id,
-            attrs.get("documentType"),
-            object_id,
-            total,
-        )
-
-        if stop_listing:
+    for plan in plans:
+        if stop_listing or not plan.get("objectId"):
             continue
-
-        def consider(item: dict[str, Any]) -> None:
-            cid = item.get("id")
-            if not cid or cid in seen_comment_ids:
-                return
-            seen_comment_ids.add(cid)
-            comment_ids.append(cid)
-
-        for item in first_items:
+        for item in iter_comment_items(client, plan):
             consider(item)
+            if args.max_comments is not None and len(comment_ids) >= args.max_comments:
+                log.info(
+                    "--max-comments=%s reached while listing IDs; remaining documents "
+                    "were counted above but their comments will not be downloaded in this run",
+                    args.max_comments,
+                )
+                stop_listing = True
+                break
 
-        need_more = total is None or int(total) > len(first_items)
-        enough = args.max_comments is not None and len(comment_ids) >= args.max_comments
-        if need_more and not enough:
-            # Resume full pagination (page 1 will be deduped).
-            for item in paginate_collection(
-                client,
-                "/comments",
-                {"filter[commentOnId]": object_id},
-                label=f"comments[{doc_id}]",
-            ):
-                consider(item)
-                if args.max_comments is not None and len(comment_ids) >= args.max_comments:
-                    break
+    log.info("Comment IDs queued for download=%s", len(comment_ids))
 
-        if args.max_comments is not None and len(comment_ids) >= args.max_comments:
-            log.info(
-                "--max-comments=%s reached while listing IDs; further documents will "
-                "still be counted (page 1 only) but not fully paged",
-                args.max_comments,
-            )
-            stop_listing = True
-
-    (out_dir / "comment_counts.json").write_text(
-        json.dumps(counts, indent=2), encoding="utf-8"
-    )
-    total_listed = sum(
-        (c["totalElements"] or 0) for c in counts if isinstance(c.get("totalElements"), int)
-    )
-    log.info(
-        "Documents=%s; sum of per-document totalElements=%s; comment IDs queued=%s",
-        len(documents),
-        total_listed,
-        len(comment_ids),
-    )
-
-    # --- Comment details ---
     fetched_new = 0
     attachments_downloaded = 0
     skipped_existing = 0
@@ -623,9 +946,9 @@ def main(argv: list[str] | None = None) -> int:
             if args.max_comments is not None and fetched_new >= args.max_comments:
                 log.info("Reached --max-comments=%s; stopping detail fetches", args.max_comments)
                 break
-            params = {} if args.no_attachments else {"include": "attachments"}
-            detail = client.get_json(f"/comments/{cid}", params)
-            raw_path.write_text(json.dumps(detail, indent=2), encoding="utf-8")
+            params = None if args.no_attachments else {"include": "attachments"}
+            detail = client.get_json(f"/comments/{api_segment(cid)}", params)
+            write_json(raw_path, detail)
             fetched_new += 1
             log.info("Saved comment detail %s", cid)
 
@@ -635,22 +958,24 @@ def main(argv: list[str] | None = None) -> int:
             continue
         files = collect_attachments(detail)
         dest_dir = attach_root / safe_filename(cid)
+        used_names: set[str] = set()
         for index, fmt in enumerate(files, start=1):
             if args.max_attachments is not None and attachments_downloaded >= args.max_attachments:
                 break
-            url = fmt["fileUrl"]
-            suffix = ""
-            parsed = urlparse(url)
-            base = Path(parsed.path).name or f"attachment-{index}"
-            if fmt.get("format") and not base.lower().endswith(f".{fmt['format']}".lower()):
-                base = f"{base}.{fmt['format']}"
-            dest = dest_dir / safe_filename(base)
+            url = fmt.get("fileUrl")
+            if not url:
+                continue
+            chosen = unique_filename(attachment_basename(fmt, index), used_names)
+            dest = destination_path(dest_dir, chosen)
+            if dest.name.lower() in used_names:
+                dest = destination_path(dest_dir, unique_filename(dest.name, used_names))
+            used_names.add(dest.name.lower())
             if dest.exists():
                 log.info("Skip existing attachment %s", dest)
                 continue
             log.info("Downloading attachment %s -> %s", url, dest)
             try:
-                client.download(url, dest)
+                client.download(str(url), dest)
                 attachments_downloaded += 1
             except Exception as exc:  # noqa: BLE001 — keep going; log the failure
                 log.error("Failed to download %s: %s", url, exc)
@@ -669,6 +994,25 @@ def main(argv: list[str] | None = None) -> int:
     )
     log.info("CSV: %s", out_dir / "comments.csv")
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    args = parse_args(argv)
+    api_key = os.environ.get("REGS_API_KEY", "").strip() or DEFAULT_KEY
+    if api_key == DEFAULT_KEY:
+        log.warning(
+            "REGS_API_KEY is unset; using DEMO_KEY. Official docs say DEMO_KEY is "
+            "for exploring the API only. api.data.gov limits DEMO_KEY to 30 "
+            "requests/IP/hour and 50/IP/day. Set REGS_API_KEY for a real pull."
+        )
+    client = RegulationsClient(args.base_url, api_key)
+    log.info("Base URL: %s", client.base_url)
+    return run(args, client)
 
 
 if __name__ == "__main__":
