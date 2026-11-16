@@ -64,7 +64,7 @@ There is no server sitting idle between pulls. Fargate starts when a job starts 
 ## What the app does
 
 1. **Preview.** A document ID shows title, agency, type, comment-period dates, whether it is open, the comment count (`meta.totalElements`), and an estimated duration at 1,000 calls/hour. A document that is not a Proposed Rule gets a warning. You can still pull it.
-2. **Background pull.** Progress shows comments saved, attachments downloaded, and failures. Refreshing the page reads the same job row.
+2. **Background pull.** Progress shows comments saved, attachments downloaded, and failures. Refreshing the page reads the same job row. History and Watches each have **My items** and **Team**. My items is only what you created. Team is every signed-in user's jobs and watches, with the creator's name, email, and time. Anyone signed in can open and download a teammate's results. Only the owner, or someone in the Cognito group `regs-admins`, can cancel or delete a job or edit or delete a watch. The API enforces that. The lists use a DynamoDB index on `scope = team`, not a table scan.
 3. **Results.** A chart of comments by day, top organizations, attachment types, form-letter clusters with a representative text, and a searchable paged table. Each row links to the comment on regulations.gov. Download the zip or either CSV.
 4. **Form letters.** After the pull, the worker normalizes comment text, builds word shingles, and clusters with MinHash. Defaults: similarity 0.8, shingle size 5, 64 hashes, 16 bands, minimum cluster size 3. Those are task environment variables (`CLUSTER_THRESHOLD`, `CLUSTER_SHINGLE_SIZE`, `CLUSTER_NUM_PERM`, `CLUSTER_BANDS`, `CLUSTER_MIN_SIZE`). The app CSV adds `clusterId` and `isFormLetter`. The CLI CSV does not, so existing CLI output stays the same.
 5. **Watches.** A document ID plus a Teams webhook. The webhook is stored in Secrets Manager in AWS (on disk only in local mode) and is never returned to the browser. The daily check lists the newest page of comments, ignores ids it has already reported, and posts an Adaptive Card only when there is something new.
@@ -106,6 +106,12 @@ If the security team does not allow tasks with public IPs, deploy with `-c creat
 | NAT | `-c createNat=true` | No |
 | Watch schedule | `-c schedule='cron(0 8 ? * MON-FRI *)'` | No. Time zone is America/New_York |
 | Teams webhook | Typed into the app per watch. Not a deploy parameter. | Only if you want alerts |
+| Entra tenant ID | `-c entraTenantId=` the Directory (tenant) ID | Only for company SSO |
+| Entra application (client) ID | `-c entraClientId=` | Only for company SSO |
+| Entra client secret ARN | `-c entraClientSecretArn=` a Secrets Manager ARN. The secret value is not a CDK parameter. | Only for company SSO |
+| Entra admin group object ID | `-c entraAdminGroupId=` optional. Members are treated like `regs-admins`. | No |
+| Entra groups claim name | `-c entraGroupsClaim=groups` (the default) | No |
+| Hide username and password | `-c ssoOnly=true` so the hosted UI offers Entra only | No |
 
 Do not put the API key or a webhook URL in `cdk.json`, the frontend, or git.
 
@@ -221,17 +227,76 @@ cdk deploy RegsComments --require-approval never `
 
 `assignPublicIp=true` means those subnets are public. `false` means they are private and already have a route to the internet (a NAT or egress VPC). This stack does not modify an imported VPC.
 
-## Microsoft Entra ID
+## How SSO works
 
-Not wired in this deploy. The pool is ready for it:
+People do not type a password into this app. The browser sends them to Cognito's hosted UI, Cognito sends them to Microsoft Entra, and Entra sends them back. Cognito then gives the browser an ID token. The API checks that token. The first successful sign-in creates the Cognito user automatically. Open sign-up with a local password stays off.
 
-1. In Entra, create an app registration. Redirect URI is the Cognito hosted UI `/saml2/idpresponse` or the OIDC callback Cognito shows when you add an OIDC provider.
-2. In the user pool, add an OIDC or SAML identity provider. For OIDC the issuer is `https://login.microsoftonline.com/{tenant-id}/v2.0`.
-3. Attribute mapping: Entra `email` and `sub` to the Cognito email and username.
-4. Add that provider to the app client's supported identity providers, next to Cognito.
-5. Users then see Entra on the hosted UI. The API keeps using the Cognito JWT, so the Lambda does not change.
+```mermaid
+sequenceDiagram
+  actor User
+  participant App as CloudFront app
+  participant Cognito as Cognito hosted UI
+  participant Entra as Microsoft Entra ID
+  participant API as API Gateway authorizer
 
-Keep `self_sign_up_enabled` false so unknown people cannot register a local password.
+  User->>App: Open the site
+  App->>Cognito: Sign in (authorization code + PKCE)
+  Cognito->>Entra: OIDC authorize
+  Entra->>User: Company sign-in
+  User->>Entra: Approve
+  Entra->>Cognito: Authorization code
+  Cognito->>Entra: Exchange code, using the client secret
+  Entra->>Cognito: ID token (email, name, groups)
+  Cognito->>App: Cognito ID token
+  App->>API: Authorization Bearer ID token
+  API->>API: Check signature, audience, and groups
+```
+
+Pass all three, or none. A partial set fails `cdk synth`.
+
+```powershell
+aws secretsmanager create-secret --name regs-comments/entra-client-secret --secret-string "THE_CLIENT_SECRET"
+cdk deploy RegsComments --require-approval never `
+  -c cognitoDomainPrefix=your-company-regs `
+  -c entraTenantId=00000000-0000-0000-0000-000000000000 `
+  -c entraClientId=11111111-1111-1111-1111-111111111111 `
+  -c entraClientSecretArn=arn:aws:secretsmanager:us-east-1:123456789012:secret:regs-comments/entra-client-secret-AbCdEf `
+  -c ssoOnly=true `
+  -c entraAdminGroupId=22222222-2222-2222-2222-222222222222
+```
+
+`-c ssoOnly=true` removes the Cognito username box from the hosted UI. Leave it off if you still want a break-glass local user. The client secret never goes in `-c` or in git. CloudFormation reads it from Secrets Manager at deploy time.
+
+Mapped claims: Entra `email` to Cognito email, `name` to full name, `preferred_username` to preferred username, and the `groups` claim (override with `-c entraGroupsClaim=`) to `custom:groups`. The API treats the Cognito group `regs-admins` as an admin. If you also pass `-c entraAdminGroupId`, a user whose groups claim contains that Entra group object ID is an admin too. Add people to `regs-admins` in the Cognito console when you are not using the Entra group id.
+
+### What to ask the Entra admin for
+
+Ask for an **app registration** (OIDC), not a SAML app, unless you are using the alternative below.
+
+| Ask for | What you do with it |
+| --- | --- |
+| Directory (tenant) ID | `-c entraTenantId` |
+| Application (client) ID | `-c entraClientId` |
+| A client secret | Store it yourself: `aws secretsmanager create-secret --name regs-comments/entra-client-secret --secret-string '...'`. Pass that secret's ARN as `-c entraClientSecretArn`. Do not email the secret back into the repo. |
+| Group object ID of the team that may administer pulls, if you want Entra to decide admins | `-c entraAdminGroupId` |
+
+Ask them to set the app registration like this:
+
+1. Redirect URI (Web): `https://<cognitoDomainPrefix>.auth.<region>.amazoncognito.com/oauth2/idpresponse`. After deploy this exact URL is the stack output `EntraRedirectUri`. Example: `https://your-company-regs.auth.us-east-1.amazoncognito.com/oauth2/idpresponse`.
+2. ID token: include the email, name, and preferred_username claims. If admins are an Entra group, also emit the security group object IDs in the `groups` claim (Token configuration → Add groups claim → Security groups → Group ID, emitted in the ID token).
+3. API permissions, delegated: `openid`, `profile`, `email`, and Microsoft Graph `User.Read`. Grant admin consent.
+4. To limit who can sign in, turn on **Assignment required** on the Enterprise application and assign the security group that should have access. Anyone not assigned is rejected by Entra before Cognito creates a user.
+5. Supported account types: single tenant (this organization only), unless the company standard says otherwise.
+
+Cognito's own callback and logout URLs, which Entra does **not** use, are the stack outputs `CognitoCallbackUrls` and `CognitoLogoutUrls`. They are:
+
+- `https://<cloudfront-domain>/`
+- `https://<your custom domain>/` when you set `domainName`
+- `http://localhost:5173/` for local development
+
+### SAML instead of OIDC
+
+This stack wires OIDC. SAML is the fallback if the identity team will not issue a client secret. You would add a Cognito SAML identity provider by hand (metadata URL `https://login.microsoftonline.com/{tenant}/federationmetadata/2007-06/federationmetadata.xml`, ACS URL `https://<cognitoDomainPrefix>.auth.<region>.amazoncognito.com/saml2/idpresponse`) and attach it to the app client. Do that only if OIDC is refused. The rest of the app still consumes the Cognito JWT.
 
 ## Teams webhook
 

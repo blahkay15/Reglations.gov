@@ -153,8 +153,9 @@ class ApiTests(unittest.TestCase):
         self.assertIn("isFormLetter", header)
 
         status, other = route("GET", f"/api/jobs/{job['jobId']}", {}, None, "someone-else", repo)
-        self.assertEqual(status, 404)
-        self.assertIsNone(other.get("jobId") if isinstance(other, dict) else None)
+        self.assertEqual(status, 200)
+        self.assertEqual(other["userId"], "user-1")
+        self.assertFalse(other["canManage"])
 
         status, watch = route(
             "POST",

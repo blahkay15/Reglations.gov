@@ -43,9 +43,38 @@ class AwsRepo(MemoryRepo):
         rows.sort(key=lambda item: item.get("createdAt") or "", reverse=True)
         return rows
 
+    def list_team_jobs(self) -> list[dict[str, Any]]:
+        return self._query_scope(self.job_table)
+
     def get_job(self, user_id: str, job_id: str) -> dict[str, Any] | None:
         response = self.job_table.get_item(Key={"userId": user_id, "jobId": job_id})
         return response.get("Item")
+
+    def find_job(self, job_id: str) -> dict[str, Any] | None:
+        response = self.job_table.query(
+            IndexName="byJobId",
+            KeyConditionExpression="jobId = :id",
+            ExpressionAttributeValues={":id": job_id},
+            Limit=1,
+        )
+        items = response.get("Items") or []
+        return items[0] if items else None
+
+    def delete_job(self, user_id: str, job_id: str) -> bool:
+        if self.get_job(user_id, job_id) is None:
+            return False
+        self.job_table.delete_item(Key={"userId": user_id, "jobId": job_id})
+        return True
+
+    def _query_scope(self, table) -> list[dict[str, Any]]:
+        response = table.query(
+            IndexName="byScope",
+            KeyConditionExpression="#scope = :team",
+            ExpressionAttributeNames={"#scope": "scope"},
+            ExpressionAttributeValues={":team": "team"},
+            ScanIndexForward=False,
+        )
+        return list(response.get("Items") or [])
 
     def update_job(self, user_id: str, job_id: str, fields: dict[str, Any]) -> dict[str, Any] | None:
         current = self.get_job(user_id, job_id)
@@ -105,16 +134,25 @@ class AwsRepo(MemoryRepo):
         )
 
     def put_watch(self, user_id: str, watch: dict[str, Any]) -> dict[str, Any]:
-        secret = self._secrets.create_secret(
-            Name=f"regs-comments/teams/{user_id}/{watch['documentId']}",
-            SecretString=watch["webhookUrl"],
-            Description="Microsoft Teams incoming webhook for a watched regulations.gov document",
-        )
+        existing = self.watch_table.get_item(Key={"userId": user_id, "documentId": watch["documentId"]}).get("Item")
+        if existing and existing.get("webhookSecretArn"):
+            self._secrets.put_secret_value(SecretId=existing["webhookSecretArn"], SecretString=watch["webhookUrl"])
+            secret_arn = existing["webhookSecretArn"]
+        else:
+            secret = self._secrets.create_secret(
+                Name=f"regs-comments/teams/{user_id}/{watch['documentId']}",
+                SecretString=watch["webhookUrl"],
+                Description="Microsoft Teams incoming webhook for a watched regulations.gov document",
+            )
+            secret_arn = secret["ARN"]
         stored = {
             "userId": user_id,
+            "ownerName": watch.get("ownerName") or "",
+            "ownerEmail": watch.get("ownerEmail") or "",
+            "scope": "team",
             "documentId": watch["documentId"],
-            "webhookSecretArn": secret["ARN"],
-            "createdAt": watch.get("createdAt"),
+            "webhookSecretArn": secret_arn,
+            "createdAt": watch.get("createdAt") or (existing or {}).get("createdAt"),
             "lastCheckedAt": watch.get("lastCheckedAt") or "",
             "seenIds": watch.get("seenIds") or [],
         }
@@ -125,8 +163,12 @@ class AwsRepo(MemoryRepo):
         response = self.watch_table.query(
             KeyConditionExpression="userId = :user",
             ExpressionAttributeValues={":user": user_id},
+            ScanIndexForward=False,
         )
-        return [self.public_watch(item) for item in response.get("Items") or []]
+        return list(response.get("Items") or [])
+
+    def list_team_watches(self) -> list[dict[str, Any]]:
+        return self._query_scope(self.watch_table)
 
     def get_watch(self, user_id: str, document_id: str) -> dict[str, Any] | None:
         response = self.watch_table.get_item(Key={"userId": user_id, "documentId": document_id})
@@ -154,8 +196,7 @@ class AwsRepo(MemoryRepo):
         )
 
     def list_all_watches(self) -> list[dict[str, Any]]:
-        response = self.watch_table.scan()
-        items = list(response.get("Items") or [])
+        items = self.list_team_watches()
         hydrated = []
         for item in items:
             if item.get("webhookSecretArn"):

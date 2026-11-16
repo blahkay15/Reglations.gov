@@ -63,7 +63,9 @@ export async function finishLogin(config: AppConfig): Promise<void> {
   if (!response.ok) {
     throw new Error("Cognito token exchange failed.");
   }
-  const payload = (await response.json()) as { access_token: string };
-  sessionStorage.setItem(TOKEN_KEY, payload.access_token);
+  const payload = (await response.json()) as { id_token: string };
+  // The ID token carries email, name, and group claims. The API authorizer
+  // checks its audience, which is this app client.
+  sessionStorage.setItem(TOKEN_KEY, payload.id_token);
   window.history.replaceState({}, "", window.location.pathname);
 }

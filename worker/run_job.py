@@ -69,6 +69,9 @@ def execute_job(job: dict[str, Any], client: Any, repo: Any, out_dir: Path) -> d
             if event.get("ok") is False:
                 current = repo.get_job(user_id, job_id) or {}
                 fields["attachmentFailures"] = int(current.get("attachmentFailures") or 0) + 1
+        current = repo.get_job(user_id, job_id) or {}
+        if current.get("status") == "cancelled":
+            raise RuntimeError("cancelled")
         if fields:
             repo.update_job(user_id, job_id, fields)
 
@@ -87,6 +90,8 @@ def execute_job(job: dict[str, Any], client: Any, repo: Any, out_dir: Path) -> d
         archive = out_dir / "comments.zip"
         zip_output(out_dir, archive)
         publish_tree(repo, job_id, out_dir)
+        if (repo.get_job(user_id, job_id) or {}).get("status") == "cancelled":
+            return summary
         repo.update_job(
             user_id,
             job_id,
@@ -100,5 +105,6 @@ def execute_job(job: dict[str, Any], client: Any, repo: Any, out_dir: Path) -> d
         )
         return summary
     except Exception as exc:
-        repo.update_job(user_id, job_id, {"status": "failed", "error": str(exc)})
+        if (repo.get_job(user_id, job_id) or {}).get("status") != "cancelled":
+            repo.update_job(user_id, job_id, {"status": "failed", "error": str(exc)})
         raise

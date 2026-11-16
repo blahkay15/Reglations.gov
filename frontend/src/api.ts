@@ -35,8 +35,12 @@ export function startJob(documentId: string, title: string): Promise<Job> {
   return request("/api/jobs", { method: "POST", body: JSON.stringify({ documentId, title }) });
 }
 
-export function listJobs(): Promise<{ jobs: Job[] }> {
-  return request("/api/jobs");
+export function listJobs(scope: "mine" | "team" = "mine"): Promise<{ jobs: Job[] }> {
+  return request(`/api/jobs?scope=${scope}`);
+}
+
+export function deleteJob(jobId: string): Promise<{ status?: string; deleted?: string }> {
+  return request(`/api/jobs/${jobId}`, { method: "DELETE" });
 }
 
 export function getJob(jobId: string): Promise<Job> {
@@ -65,8 +69,8 @@ export async function downloadJob(jobId: string, kind: "zip" | "comments" | "att
   window.location.assign(payload.url);
 }
 
-export function listWatches(): Promise<{ watches: Watch[] }> {
-  return request("/api/watches");
+export function listWatches(scope: "mine" | "team" = "mine"): Promise<{ watches: Watch[] }> {
+  return request(`/api/watches?scope=${scope}`);
 }
 
 export function createWatch(documentId: string, webhookUrl: string): Promise<Watch> {
@@ -76,6 +80,16 @@ export function createWatch(documentId: string, webhookUrl: string): Promise<Wat
   });
 }
 
-export function deleteWatch(documentId: string): Promise<{ deleted: string }> {
-  return request(`/api/watches/${encodeURIComponent(documentId)}`, { method: "DELETE" });
+export function deleteWatch(documentId: string, ownerId?: string): Promise<{ deleted: string }> {
+  const path = ownerId
+    ? `/api/watches/${encodeURIComponent(ownerId)}/${encodeURIComponent(documentId)}`
+    : `/api/watches/${encodeURIComponent(documentId)}`;
+  return request(path, { method: "DELETE" });
+}
+
+export function replaceWatchWebhook(ownerId: string, documentId: string, webhookUrl: string): Promise<Watch> {
+  return request(`/api/watches/${encodeURIComponent(ownerId)}/${encodeURIComponent(documentId)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ webhookUrl }),
+  });
 }

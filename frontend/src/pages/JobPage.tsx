@@ -1,11 +1,12 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { useParams } from "react-router-dom";
-import { downloadJob, getComments, getJob, getSummary } from "../api";
+import { useNavigate, useParams } from "react-router-dom";
+import { deleteJob, downloadJob, getComments, getJob, getSummary } from "../api";
 import { Bars } from "../components/Bars";
 import type { CommentPage, Job, Summary } from "../types";
 
 export function JobPage() {
   const { jobId = "" } = useParams();
+  const navigate = useNavigate();
   const [job, setJob] = useState<Job | null>(null);
   const [summary, setSummary] = useState<Summary | null>(null);
   const [page, setPage] = useState<CommentPage | null>(null);
@@ -56,7 +57,23 @@ export function JobPage() {
       <h1 className="mt-1 font-serif text-4xl">{job.title || "Comment pull"}</h1>
       <p className="mt-2 text-sm text-ink/70">
         Status: <span className="font-medium text-ink">{job.status}</span>
+        {job.ownerName ? ` · started by ${job.ownerName}` : ""}
+        {job.createdAt ? ` · ${job.createdAt}` : ""}
       </p>
+      {job.canManage ? (
+        <button
+          className="mt-3 text-sm text-copper"
+          onClick={() =>
+            deleteJob(jobId).then((result) => {
+              if (result.deleted) navigate("/history");
+              else getJob(jobId).then(setJob);
+            })
+          }
+          type="button"
+        >
+          {job.status === "queued" || job.status === "running" ? "Cancel pull" : "Delete pull"}
+        </button>
+      ) : null}
       {job.error ? <p className="mt-3 text-sm text-copper">{job.error}</p> : null}
       {running ? (
         <div className="mt-6 max-w-xl">

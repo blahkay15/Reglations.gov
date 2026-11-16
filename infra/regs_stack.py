@@ -105,7 +105,7 @@ class RegsStack(Stack):
             secret_name="regs-comments/api-key",
             description="regulations.gov API key. Put the value in after deploy. A raw string or {\"apiKey\": \"...\"} both work.",
         )
-        jobs = self._table("Jobs", "jobId")
+        jobs = self._table("Jobs", "jobId", job_lookup=True)
         watches = self._table("Watches", "documentId")
         repository = ecr.Repository(
             self,
@@ -128,6 +128,7 @@ class RegsStack(Stack):
             "SUBNET_IDS": Fn.join(",", subnet_selection.subnet_ids),
             "TASK_SECURITY_GROUP": task_security_group.security_group_id,
             "ASSIGN_PUBLIC_IP": "ENABLED" if assign_public_ip else "DISABLED",
+            "ENTRA_ADMIN_GROUP_ID": _text(self, "entraAdminGroupId"),
         }
 
         api_fn = lambda_.Function(
@@ -164,16 +165,29 @@ class RegsStack(Stack):
             )
         )
 
+        entra = self._entra_settings()
         user_pool = cognito.UserPool(
             self,
             "Users",
             self_sign_up_enabled=False,
             sign_in_aliases=cognito.SignInAliases(email=True),
-            standard_attributes=cognito.StandardAttributes(email=cognito.StandardAttribute(required=True, mutable=True)),
+            standard_attributes=cognito.StandardAttributes(
+                email=cognito.StandardAttribute(required=True, mutable=True),
+                fullname=cognito.StandardAttribute(required=False, mutable=True),
+            ),
+            custom_attributes={"groups": cognito.StringAttribute(mutable=True)} if entra else None,
             account_recovery=cognito.AccountRecovery.EMAIL_ONLY,
+        )
+        cognito.CfnUserPoolGroup(
+            self,
+            "Admins",
+            user_pool_id=user_pool.user_pool_id,
+            group_name="regs-admins",
+            description="Can cancel any pull and edit or delete any watch",
         )
         prefix = _text(self, "cognitoDomainPrefix", "regs-comments-dev")
         user_pool.add_domain("HostedUi", cognito_domain=cognito.CognitoDomainOptions(domain_prefix=prefix))
+        entra_provider = self._entra_provider(user_pool, entra) if entra else None
 
         http_api = apigwv2.HttpApi(
             self,
@@ -191,6 +205,14 @@ class RegsStack(Stack):
         ]
         if domain_name:
             callback_urls.append(f"https://{domain_name}/")
+        providers = [cognito.UserPoolClientIdentityProvider.COGNITO]
+        if entra_provider is not None:
+            providers = [cognito.UserPoolClientIdentityProvider.custom(entra_provider.provider_name)]
+            if not entra["sso_only"]:
+                providers.append(cognito.UserPoolClientIdentityProvider.COGNITO)
+        read_attributes = cognito.ClientAttributes().with_standard_attributes(email=True, fullname=True)
+        if entra:
+            read_attributes = read_attributes.with_custom_attributes("groups")
         client = user_pool.add_client(
             "Web",
             generate_secret=False,
@@ -200,9 +222,12 @@ class RegsStack(Stack):
                 callback_urls=callback_urls,
                 logout_urls=callback_urls,
             ),
-            supported_identity_providers=[cognito.UserPoolClientIdentityProvider.COGNITO],
-            auth_flows=cognito.AuthFlow(user_password=True),
+            supported_identity_providers=providers,
+            auth_flows=cognito.AuthFlow(user_password=not entra or not entra["sso_only"]),
+            read_attributes=read_attributes,
         )
+        if entra_provider is not None:
+            client.node.add_dependency(entra_provider)
         authorizer = authz.HttpJwtAuthorizer(
             "CognitoJwt",
             f"https://cognito-idp.{self.region}.amazonaws.com/{user_pool.user_pool_id}",
@@ -224,13 +249,17 @@ class RegsStack(Stack):
         CfnOutput(self, "DataBucket", value=data_bucket.bucket_name)
         CfnOutput(self, "UserPoolId", value=user_pool.user_pool_id)
         CfnOutput(self, "UserPoolClientId", value=client.user_pool_client_id)
-        CfnOutput(self, "CognitoHostedUi", value=f"https://{prefix}.auth.{self.region}.amazoncognito.com")
+        hosted_ui = f"https://{prefix}.auth.{self.region}.amazoncognito.com"
+        CfnOutput(self, "CognitoHostedUi", value=hosted_ui)
+        CfnOutput(self, "EntraRedirectUri", value=f"{hosted_ui}/oauth2/idpresponse")
+        CfnOutput(self, "CognitoCallbackUrls", value=Fn.join(",", callback_urls))
+        CfnOutput(self, "CognitoLogoutUrls", value=Fn.join(",", callback_urls))
         CfnOutput(self, "ApiKeySecretArn", value=api_key.secret_arn)
         CfnOutput(self, "WorkerRepository", value=repository.repository_uri)
         CfnOutput(self, "ClusterName", value=cluster.cluster_name)
 
-    def _table(self, name: str, sort_key: str) -> dynamodb.Table:
-        return dynamodb.Table(
+    def _table(self, name: str, sort_key: str, *, job_lookup: bool = False) -> dynamodb.Table:
+        table = dynamodb.Table(
             self,
             name,
             partition_key=dynamodb.Attribute(name="userId", type=dynamodb.AttributeType.STRING),
@@ -241,6 +270,63 @@ class RegsStack(Stack):
                 point_in_time_recovery_enabled=True
             ),
             removal_policy=RemovalPolicy.RETAIN,
+        )
+        # Team view queries this index. Every item uses scope="team", so the
+        # query is one partition, newest first, and never a table scan.
+        table.add_global_secondary_index(
+            index_name="byScope",
+            partition_key=dynamodb.Attribute(name="scope", type=dynamodb.AttributeType.STRING),
+            sort_key=dynamodb.Attribute(name="createdAt", type=dynamodb.AttributeType.STRING),
+            projection_type=dynamodb.ProjectionType.ALL,
+        )
+        if job_lookup:
+            table.add_global_secondary_index(
+                index_name="byJobId",
+                partition_key=dynamodb.Attribute(name="jobId", type=dynamodb.AttributeType.STRING),
+                projection_type=dynamodb.ProjectionType.ALL,
+            )
+        return table
+
+    def _entra_settings(self) -> dict[str, str | bool] | None:
+        tenant = _text(self, "entraTenantId")
+        client_id = _text(self, "entraClientId")
+        secret_arn = _text(self, "entraClientSecretArn")
+        provided = [bool(tenant), bool(client_id), bool(secret_arn)]
+        if not any(provided):
+            if _flag(self, "ssoOnly", False):
+                raise ValueError("ssoOnly=true requires entraTenantId, entraClientId, and entraClientSecretArn.")
+            return None
+        if not all(provided):
+            raise ValueError("Entra sign-in needs all of entraTenantId, entraClientId, and entraClientSecretArn.")
+        return {
+            "tenant": tenant,
+            "client_id": client_id,
+            "secret_arn": secret_arn,
+            "groups_claim": _text(self, "entraGroupsClaim", "groups"),
+            "sso_only": _flag(self, "ssoOnly", False),
+        }
+
+    def _entra_provider(self, user_pool: cognito.UserPool, settings: dict[str, str | bool]) -> cognito.UserPoolIdentityProviderOidc:
+        # CloudFormation resolves this when the stack deploys. The secret
+        # value is not in the template or in CDK context.
+        client_secret = cdk.SecretValue.secrets_manager(str(settings["secret_arn"])).unsafe_unwrap()
+        mapping = cognito.AttributeMapping(
+            email=cognito.ProviderAttribute.other("email"),
+            fullname=cognito.ProviderAttribute.other("name"),
+            preferred_username=cognito.ProviderAttribute.other("preferred_username"),
+            custom={"groups": cognito.ProviderAttribute.other(str(settings["groups_claim"]))},
+        )
+        return cognito.UserPoolIdentityProviderOidc(
+            self,
+            "Entra",
+            name="Entra",
+            user_pool=user_pool,
+            client_id=str(settings["client_id"]),
+            client_secret=client_secret,
+            issuer_url=f"https://login.microsoftonline.com/{settings['tenant']}/v2.0",
+            scopes=["openid", "email", "profile"],
+            attribute_mapping=mapping,
+            identifiers=["Entra"],
         )
 
     def _vpc(self) -> tuple[ec2.IVpc, ec2.SelectedSubnets, bool]:

@@ -19,6 +19,9 @@ export type Preview = {
 export type Job = {
   jobId: string;
   userId: string;
+  ownerName?: string;
+  ownerEmail?: string;
+  canManage?: boolean;
   documentId: string;
   status: "queued" | "running" | "succeeded" | "failed";
   createdAt: string;
@@ -74,8 +77,12 @@ export type CommentPage = {
 };
 
 export type Watch = {
+  userId: string;
+  ownerName: string;
+  ownerEmail: string;
   documentId: string;
   createdAt: string;
   lastCheckedAt: string;
   webhookConfigured: boolean;
+  canManage: boolean;
 };

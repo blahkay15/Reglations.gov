@@ -1,22 +1,24 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { createWatch, deleteWatch, listWatches } from "../api";
+import { createWatch, deleteWatch, listWatches, replaceWatchWebhook } from "../api";
+import { ScopeTabs } from "../components/ScopeTabs";
 import type { Watch } from "../types";
 
 export function WatchesPage() {
+  const [scope, setScope] = useState<"mine" | "team">("mine");
   const [watches, setWatches] = useState<Watch[]>([]);
   const [documentId, setDocumentId] = useState("");
   const [webhookUrl, setWebhookUrl] = useState("");
   const [error, setError] = useState("");
 
-  function refresh() {
-    listWatches()
+  function refresh(next = scope) {
+    listWatches(next)
       .then((payload) => setWatches(payload.watches))
       .catch((err: Error) => setError(err.message));
   }
 
   useEffect(() => {
-    refresh();
-  }, []);
+    refresh(scope);
+  }, [scope]);
 
   async function onCreate(event: FormEvent) {
     event.preventDefault();
@@ -32,7 +34,8 @@ export function WatchesPage() {
 
   return (
     <section className="max-w-3xl">
-      <h1 className="font-serif text-4xl">Watch a document</h1>
+      <h1 className="font-serif text-4xl">{scope === "mine" ? "My watches" : "Team watches"}</h1>
+      <ScopeTabs scope={scope} onChange={setScope} />
       <p className="mt-3 text-sm leading-6 text-ink/75">
         On weekdays the scheduler checks for comments it has not reported yet. If nothing is new,
         it stays quiet. The webhook URL is stored for the server only and is not shown again.
@@ -66,23 +69,73 @@ export function WatchesPage() {
       <ul className="mt-6 divide-y divide-line rounded-xl border border-line bg-card">
         {watches.length === 0 ? <li className="px-4 py-3 text-sm text-ink/60">No watches yet.</li> : null}
         {watches.map((watch) => (
-          <li key={watch.documentId} className="flex items-center justify-between px-4 py-3 text-sm">
-            <div>
-              <p className="font-medium">{watch.documentId}</p>
-              <p className="text-xs text-ink/50">
-                {watch.webhookConfigured ? "Webhook stored" : "No webhook"} · last check {watch.lastCheckedAt || "never"}
-              </p>
+          <li key={`${watch.userId}-${watch.documentId}`} className="px-4 py-3 text-sm">
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <p className="font-medium">{watch.documentId}</p>
+                <p className="text-xs text-ink/50">
+                  {scope === "team" ? `${watch.ownerName || watch.ownerEmail || watch.userId} · ` : ""}
+                  {watch.webhookConfigured ? "Webhook stored" : "No webhook"} · {watch.createdAt} · last check{" "}
+                  {watch.lastCheckedAt || "never"}
+                </p>
+              </div>
+              {watch.canManage ? (
+                <button
+                  className="text-copper"
+                  onClick={() => deleteWatch(watch.documentId, scope === "team" ? watch.userId : undefined).then(() => refresh())}
+                  type="button"
+                >
+                  Remove
+                </button>
+              ) : null}
             </div>
-            <button
-              className="text-copper"
-              onClick={() => deleteWatch(watch.documentId).then(refresh)}
-              type="button"
-            >
-              Remove
-            </button>
+            {watch.canManage ? (
+              <ReplaceWebhook ownerId={watch.userId} documentId={watch.documentId} onDone={() => refresh()} />
+            ) : null}
           </li>
         ))}
       </ul>
     </section>
+  );
+}
+
+function ReplaceWebhook({
+  ownerId,
+  documentId,
+  onDone,
+}: {
+  ownerId: string;
+  documentId: string;
+  onDone: () => void;
+}) {
+  const [webhookUrl, setWebhookUrl] = useState("");
+  const [error, setError] = useState("");
+
+  async function onSubmit(event: FormEvent) {
+    event.preventDefault();
+    setError("");
+    try {
+      await replaceWatchWebhook(ownerId, documentId, webhookUrl.trim());
+      setWebhookUrl("");
+      onDone();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not replace the webhook.");
+    }
+  }
+
+  return (
+    <form className="mt-3 flex flex-wrap items-center gap-2" onSubmit={onSubmit}>
+      <input
+        className="min-w-64 flex-1 rounded-md border border-line px-2 py-1 text-xs"
+        placeholder="Replace webhook URL"
+        type="url"
+        value={webhookUrl}
+        onChange={(event) => setWebhookUrl(event.target.value)}
+      />
+      <button className="rounded border border-line px-2 py-1 text-xs" type="submit">
+        Save
+      </button>
+      {error ? <span className="text-xs text-copper">{error}</span> : null}
+    </form>
   );
 }

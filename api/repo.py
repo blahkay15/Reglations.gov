@@ -38,9 +38,23 @@ class MemoryRepo:
         rows.sort(key=lambda item: item.get("createdAt") or "", reverse=True)
         return rows
 
+    def list_team_jobs(self) -> list[dict[str, Any]]:
+        rows = [dict(job) for job in self.jobs.values()]
+        rows.sort(key=lambda item: item.get("createdAt") or "", reverse=True)
+        return rows
+
     def get_job(self, user_id: str, job_id: str) -> dict[str, Any] | None:
         job = self.jobs.get((user_id, job_id))
         return dict(job) if job else None
+
+    def find_job(self, job_id: str) -> dict[str, Any] | None:
+        for (owner, stored_id), job in self.jobs.items():
+            if stored_id == job_id:
+                return dict(job)
+        return None
+
+    def delete_job(self, user_id: str, job_id: str) -> bool:
+        return self.jobs.pop((user_id, job_id), None) is not None
 
     def update_job(self, user_id: str, job_id: str, fields: dict[str, Any]) -> dict[str, Any] | None:
         with self._lock:
@@ -69,8 +83,13 @@ class MemoryRepo:
             return self.public_watch(watch)
 
     def list_watches(self, user_id: str) -> list[dict[str, Any]]:
-        rows = [self.public_watch(watch) for (owner, _doc), watch in self.watches.items() if owner == user_id]
-        rows.sort(key=lambda item: item.get("documentId") or "")
+        rows = [dict(watch) for (owner, _doc), watch in self.watches.items() if owner == user_id]
+        rows.sort(key=lambda item: item.get("createdAt") or "", reverse=True)
+        return rows
+
+    def list_team_watches(self) -> list[dict[str, Any]]:
+        rows = [dict(watch) for watch in self.watches.values()]
+        rows.sort(key=lambda item: item.get("createdAt") or "", reverse=True)
         return rows
 
     def get_watch(self, user_id: str, document_id: str) -> dict[str, Any] | None:
@@ -94,11 +113,14 @@ class MemoryRepo:
     def public_watch(watch: dict[str, Any]) -> dict[str, Any]:
         """Fields safe to send to the browser. The webhook URL is not one of them."""
         return {
-            "documentId": watch.get("documentId"),
-            "createdAt": watch.get("createdAt"),
-            "lastCheckedAt": watch.get("lastCheckedAt"),
-            "webhookConfigured": bool(watch.get("webhookUrl") or watch.get("webhookSecretArn")),
-        }
+        "userId": watch.get("userId"),
+        "ownerName": watch.get("ownerName") or "",
+        "ownerEmail": watch.get("ownerEmail") or "",
+        "documentId": watch.get("documentId"),
+        "createdAt": watch.get("createdAt"),
+        "lastCheckedAt": watch.get("lastCheckedAt"),
+        "webhookConfigured": bool(watch.get("webhookUrl") or watch.get("webhookSecretArn")),
+    }
 
 
 class DiskRepo(MemoryRepo):
@@ -159,6 +181,13 @@ class DiskRepo(MemoryRepo):
     def delete_watch(self, user_id: str, document_id: str) -> bool:
         removed = super().delete_watch(user_id, document_id)
         path = self._watch_path(user_id, document_id)
+        if path.exists():
+            path.unlink()
+        return removed
+
+    def delete_job(self, user_id: str, job_id: str) -> bool:
+        removed = super().delete_job(user_id, job_id)
+        path = self._job_path(user_id, job_id)
         if path.exists():
             path.unlink()
         return removed

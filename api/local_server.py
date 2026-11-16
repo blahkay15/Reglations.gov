@@ -16,7 +16,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from api.fixture import FixtureClient
-from api.handler import route
+from api.handler import Actor, route
 from api.repo import DiskRepo
 from regs_pull.preview import preview_document
 
@@ -52,8 +52,14 @@ REPO.start_job = _start  # type: ignore[method-assign]
 class Handler(BaseHTTPRequestHandler):
     server_version = "regs-local/1.0"
 
-    def _user(self) -> str:
-        return self.headers.get("X-Local-User", "local")
+    def _actor(self) -> Actor:
+        user_id = self.headers.get("X-Local-User", "local")
+        return Actor(
+            user_id=user_id,
+            email=self.headers.get("X-Local-Email", ""),
+            name=self.headers.get("X-Local-Name", user_id),
+            admin=self.headers.get("X-Local-Admin", "").lower() in {"1", "true", "yes"},
+        )
 
     def _send(self, status: int, payload: dict | bytes, content_type: str = "application/json") -> None:
         body = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
@@ -67,8 +73,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:  # noqa: N802
         self.send_response(204)
         self.send_header("access-control-allow-origin", "*")
-        self.send_header("access-control-allow-headers", "content-type, x-local-user")
-        self.send_header("access-control-allow-methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header(
+            "access-control-allow-headers",
+            "content-type, x-local-user, x-local-name, x-local-email, x-local-admin",
+        )
+        self.send_header("access-control-allow-methods", "GET, POST, PATCH, DELETE, OPTIONS")
         self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802
@@ -89,7 +98,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, data, content_type)
             return
         query = {key: values[-1] for key, values in parse_qs(parsed.query).items()}
-        status, body = route("GET", parsed.path, query, None, self._user(), REPO, previewer=_preview)
+        actor = self._actor()
+        status, body = route("GET", parsed.path, query, None, actor.user_id, REPO, actor=actor, previewer=_preview)
         self._send(status, body)
 
     def do_POST(self) -> None:  # noqa: N802
@@ -101,12 +111,27 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"error": "Request body must be JSON."})
             return
         parsed = urlparse(self.path)
-        status, body = route("POST", parsed.path, {}, payload, self._user(), REPO, previewer=_preview)
+        actor = self._actor()
+        status, body = route("POST", parsed.path, {}, payload, actor.user_id, REPO, actor=actor, previewer=_preview)
         self._send(status, body)
 
     def do_DELETE(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
-        status, body = route("DELETE", parsed.path, {}, None, self._user(), REPO, previewer=_preview)
+        actor = self._actor()
+        status, body = route("DELETE", parsed.path, {}, None, actor.user_id, REPO, actor=actor, previewer=_preview)
+        self._send(status, body)
+
+    def do_PATCH(self) -> None:  # noqa: N802
+        length = int(self.headers.get("content-length") or "0")
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            payload = json.loads(raw.decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            self._send(400, {"error": "Request body must be JSON."})
+            return
+        parsed = urlparse(self.path)
+        actor = self._actor()
+        status, body = route("PATCH", parsed.path, {}, payload, actor.user_id, REPO, actor=actor, previewer=_preview)
         self._send(status, body)
 
     def log_message(self, fmt: str, *args) -> None:
