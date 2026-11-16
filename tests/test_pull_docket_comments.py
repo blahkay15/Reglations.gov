@@ -16,10 +16,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pull_docket_comments import (  # noqa: E402
+    ATTACHMENT_CSV_COLUMNS,
+    CSV_COLUMNS,
     eastern_filter_value,
     log,
     paginate_collection,
     parse_args,
+    rebuild_csv_from_raw,
     run,
     safe_filename,
     destination_path,
@@ -94,6 +97,7 @@ class FakeClient:
                 "format": "pdf",
             }
         ]
+        self.fail_downloads = False
         self.comment_pages: dict[str, list[dict]] = {}
         self.docket_documents = [
             document(DOC_ID, "Proposed Rule", OBJECT_ID, title="Proposed rule"),
@@ -149,6 +153,8 @@ class FakeClient:
 
     def download(self, url, dest: Path):
         self.events.append(("download", url, Path(dest).name))
+        if self.fail_downloads:
+            raise RuntimeError("simulated download failure")
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(b"attachment-bytes")
 
@@ -348,9 +354,28 @@ class RunTests(unittest.TestCase):
             self.assertTrue(raw.startswith(b"\xef\xbb\xbf"))
             with (out / "comments.csv").open(encoding="utf-8-sig", newline="") as fh:
                 rows = list(csv.DictReader(fh))
+            self.assertEqual(list(rows[0].keys()), CSV_COLUMNS)
             self.assertEqual(rows[0]["id"], "C1")
+            self.assertEqual(rows[0]["documentId"], DOC_ID)
             self.assertEqual(rows[0]["comment"], 'café, "hello"')
             self.assertEqual(rows[0]["attachmentCount"], "1")
+            self.assertEqual(rows[0]["attachmentFiles"], r"attachments\C1\my_bad_name.pdf")
+            attachment_bytes = (out / "attachments.csv").read_bytes()
+            self.assertTrue(attachment_bytes.startswith(b"\xef\xbb\xbf"))
+            with (out / "attachments.csv").open(encoding="utf-8-sig", newline="") as fh:
+                attachment_rows = list(csv.DictReader(fh))
+            self.assertEqual(list(attachment_rows[0].keys()), ATTACHMENT_CSV_COLUMNS)
+            self.assertEqual(attachment_rows[0]["commentId"], "C1")
+            self.assertEqual(attachment_rows[0]["documentId"], DOC_ID)
+            self.assertEqual(attachment_rows[0]["fileName"], "my_bad_name.pdf")
+            self.assertEqual(attachment_rows[0]["localPath"], r"attachments\C1\my_bad_name.pdf")
+            self.assertEqual(attachment_rows[0]["format"], "pdf")
+            self.assertEqual(
+                attachment_rows[0]["sourceUrl"],
+                "https://downloads.regulations.gov/files/my:bad*name.pdf",
+            )
+            self.assertEqual(attachment_rows[0]["downloaded"], "yes")
+            self.assertEqual(attachment_rows[0]["fileSizeBytes"], str(len(b"attachment-bytes")))
             counts = json.loads((out / "comment_counts.json").read_text(encoding="utf-8"))
             self.assertEqual(counts[0]["totalElements"], 1)
             self.assertEqual(counts[0]["objectId"], OBJECT_ID)
@@ -514,6 +539,124 @@ class RunTests(unittest.TestCase):
                     parse_args(["--docket", "OTHER-DOCKET", "--document-id", DOC_ID, "--out", tmp]),
                     client,
                 )
+
+    def test_resume_counts_attachment_already_on_disk(self):
+        client = FakeClient()
+        detail = comment_detail("C1", attachments=client.attachments)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            raw = out / "raw"
+            raw.mkdir()
+            (raw / "C1.json").write_text(json.dumps(detail), encoding="utf-8")
+            saved = out / "attachments" / "C1" / "my_bad_name.pdf"
+            saved.parent.mkdir(parents=True)
+            saved.write_bytes(b"already-there")
+            run(parse_args(["--document-id", DOC_ID, "--out", str(out)]), client)
+            with (out / "comments.csv").open(encoding="utf-8-sig", newline="") as fh:
+                comments = list(csv.DictReader(fh))
+            with (out / "attachments.csv").open(encoding="utf-8-sig", newline="") as fh:
+                attachments = list(csv.DictReader(fh))
+            self.assertEqual(saved.read_bytes(), b"already-there")
+        downloads = [event for event in client.events if event[0] == "download"]
+        self.assertEqual(downloads, [])
+        self.assertEqual(comments[0]["attachmentCount"], "1")
+        self.assertEqual(comments[0]["attachmentFiles"], r"attachments\C1\my_bad_name.pdf")
+        self.assertEqual(attachments[0]["downloaded"], "yes")
+        self.assertEqual(attachments[0]["fileSizeBytes"], str(len(b"already-there")))
+
+    def test_rebuild_from_raw_marks_only_files_on_disk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            raw = out / "raw"
+            raw.mkdir()
+            kept = {
+                "fileUrl": "https://downloads.regulations.gov/files/kept.pdf",
+                "format": "pdf",
+                "size": 10,
+            }
+            missing = {
+                "fileUrl": "https://downloads.regulations.gov/files/missing.docx",
+                "format": "docx",
+                "size": 20,
+            }
+            (raw / "C1.json").write_text(
+                json.dumps(comment_detail("C1", attachments=[kept])),
+                encoding="utf-8",
+            )
+            (raw / "C2.json").write_text(
+                json.dumps(comment_detail("C2", attachments=[missing])),
+                encoding="utf-8",
+            )
+            dest = out / "attachments" / "C1" / "kept.pdf"
+            dest.parent.mkdir(parents=True)
+            dest.write_bytes(b"x" * 10)
+            rebuild_csv_from_raw(out)
+            with (out / "comments.csv").open(encoding="utf-8-sig", newline="") as fh:
+                comments = list(csv.DictReader(fh))
+            with (out / "attachments.csv").open(encoding="utf-8-sig", newline="") as fh:
+                attachments = list(csv.DictReader(fh))
+        by_id = {row["id"]: row for row in comments}
+        self.assertEqual(by_id["C1"]["attachmentFiles"], r"attachments\C1\kept.pdf")
+        self.assertEqual(by_id["C2"]["attachmentCount"], "1")
+        self.assertEqual(by_id["C2"]["attachmentFiles"], "")
+        self.assertEqual(
+            [(row["commentId"], row["fileName"], row["downloaded"], row["fileSizeBytes"]) for row in attachments],
+            [("C1", "kept.pdf", "yes", "10"), ("C2", "missing.docx", "no", "20")],
+        )
+
+    def test_max_attachments_still_lists_files_not_downloaded(self):
+        client = FakeClient()
+        client.attachments = [
+            {
+                "fileUrl": "https://downloads.regulations.gov/one/report.pdf",
+                "format": "pdf",
+                "size": 100,
+            },
+            {
+                "fileUrl": "https://downloads.regulations.gov/two/report.pdf?x=2",
+                "format": "pdf",
+                "size": 250,
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            run(
+                parse_args(
+                    ["--document-id", DOC_ID, "--out", str(out), "--max-attachments", "1"]
+                ),
+                client,
+            )
+            with (out / "comments.csv").open(encoding="utf-8-sig", newline="") as fh:
+                comments = list(csv.DictReader(fh))
+            with (out / "attachments.csv").open(encoding="utf-8-sig", newline="") as fh:
+                attachments = list(csv.DictReader(fh))
+        downloads = [event for event in client.events if event[0] == "download"]
+        self.assertEqual([event[2] for event in downloads], ["report.pdf"])
+        self.assertEqual(comments[0]["attachmentCount"], "2")
+        self.assertEqual(comments[0]["attachmentFiles"], r"attachments\C1\report.pdf")
+        self.assertEqual(
+            [(row["fileName"], row["downloaded"], row["fileSizeBytes"], row["localPath"]) for row in attachments],
+            [
+                ("report.pdf", "yes", "100", r"attachments\C1\report.pdf"),
+                ("report-2.pdf", "no", "250", r"attachments\C1\report-2.pdf"),
+            ],
+        )
+
+    def test_failed_download_is_listed_as_not_downloaded(self):
+        client = FakeClient()
+        client.fail_downloads = True
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            run(parse_args(["--document-id", DOC_ID, "--out", str(out)]), client)
+            with (out / "comments.csv").open(encoding="utf-8-sig", newline="") as fh:
+                comments = list(csv.DictReader(fh))
+            with (out / "attachments.csv").open(encoding="utf-8-sig", newline="") as fh:
+                attachments = list(csv.DictReader(fh))
+        self.assertEqual(comments[0]["attachmentCount"], "1")
+        self.assertEqual(comments[0]["attachmentFiles"], "")
+        self.assertEqual(attachments[0]["downloaded"], "no")
+        self.assertEqual(attachments[0]["fileName"], "my_bad_name.pdf")
+        self.assertFalse((out / "attachments" / "C1" / "my_bad_name.pdf").exists())
 
 
 if __name__ == "__main__":

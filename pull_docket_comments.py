@@ -54,6 +54,18 @@ CSV_COLUMNS = [
     "organization",
     "comment",
     "attachmentCount",
+    "attachmentFiles",
+]
+
+ATTACHMENT_CSV_COLUMNS = [
+    "commentId",
+    "documentId",
+    "fileName",
+    "localPath",
+    "format",
+    "sourceUrl",
+    "downloaded",
+    "fileSizeBytes",
 ]
 
 log = logging.getLogger("pull_docket_comments")
@@ -171,6 +183,53 @@ def attachment_basename(fmt: dict[str, Any], index: int) -> str:
 
 def api_segment(value: str) -> str:
     return quote(str(value), safe="-._")
+
+
+def csv_local_path(*parts: str) -> str:
+    """Relative path for the CSVs.
+
+    Always backslash-separated so Windows Excel can open the path, including
+    when the script itself ran on another operating system.
+    """
+    return "\\".join(parts)
+
+
+def assign_attachment_destinations(
+    comment_id: str, files: list[dict[str, Any]], attach_root: Path
+) -> list[tuple[dict[str, Any], Path]]:
+    """Map each attachment to the same local path the downloader uses."""
+    dest_dir = attach_root / safe_filename(comment_id)
+    used_names: set[str] = set()
+    assigned: list[tuple[dict[str, Any], Path]] = []
+    for index, fmt in enumerate(files, start=1):
+        if not fmt.get("fileUrl"):
+            continue
+        chosen = unique_filename(attachment_basename(fmt, index), used_names)
+        dest = destination_path(dest_dir, chosen)
+        if dest.name.lower() in used_names:
+            dest = destination_path(dest_dir, unique_filename(dest.name, used_names))
+        used_names.add(dest.name.lower())
+        assigned.append((fmt, dest))
+    return assigned
+
+
+def file_size_bytes(fmt: dict[str, Any], dest: Path) -> str:
+    """API `size` when present, otherwise the on-disk size, otherwise blank."""
+    size = fmt.get("size")
+    if isinstance(size, bool):
+        size = None
+    if isinstance(size, int):
+        return str(size)
+    if isinstance(size, float) and size >= 0 and size.is_integer():
+        return str(int(size))
+    if isinstance(size, str) and size.strip().isdigit():
+        return size.strip()
+    if dest.is_file():
+        try:
+            return str(dest.stat().st_size)
+        except OSError:
+            return ""
+    return ""
 
 
 class RegulationsClient:
@@ -465,12 +524,18 @@ def collect_attachments(detail: dict[str, Any]) -> list[dict[str, Any]]:
     return files
 
 
-def comment_row(detail: dict[str, Any], attachment_count: int) -> dict[str, Any]:
+def comment_document_id(detail: dict[str, Any]) -> str:
+    data = detail.get("data") or {}
+    attrs = data.get("attributes") or {}
+    return str(attrs.get("commentOnDocumentId") or attrs.get("documentId") or "")
+
+
+def comment_row(detail: dict[str, Any], downloaded_paths: list[str]) -> dict[str, Any]:
     data = detail.get("data") or {}
     attrs = data.get("attributes") or {}
     return {
         "id": data.get("id") or "",
-        "documentId": attrs.get("commentOnDocumentId") or attrs.get("documentId") or "",
+        "documentId": comment_document_id(detail),
         "title": attrs.get("title") or "",
         "postedDate": attrs.get("postedDate") or "",
         "receiveDate": attrs.get("receiveDate") or "",
@@ -478,7 +543,8 @@ def comment_row(detail: dict[str, Any], attachment_count: int) -> dict[str, Any]
         "lastName": attrs.get("lastName") or "",
         "organization": attrs.get("organization") or "",
         "comment": attrs.get("comment") or "",
-        "attachmentCount": attachment_count,
+        "attachmentCount": len(collect_attachments(detail)),
+        "attachmentFiles": "; ".join(downloaded_paths),
     }
 
 
@@ -489,25 +555,57 @@ def write_json(path: Path, payload: Any) -> None:
         fh.write("\n")
 
 
-def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+def write_csv(path: Path, rows: list[dict[str, Any]], columns: list[str]) -> None:
     """UTF-8 with BOM so Excel on Windows opens the file as Unicode."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8-sig") as fh:
-        writer = csv.DictWriter(fh, fieldnames=CSV_COLUMNS, extrasaction="ignore")
+        writer = csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
 
 
-def rebuild_csv_from_raw(out_dir: Path) -> list[dict[str, Any]]:
+def attachment_rows_for(detail: dict[str, Any], out_dir: Path) -> list[dict[str, Any]]:
+    """One CSV row per known attachment. Files already on disk count as downloaded."""
+    data = detail.get("data") or {}
+    comment_id = str(data.get("id") or "")
+    document_id = comment_document_id(detail)
+    folder = safe_filename(comment_id)
     rows: list[dict[str, Any]] = []
+    for fmt, dest in assign_attachment_destinations(
+        comment_id, collect_attachments(detail), out_dir / "attachments"
+    ):
+        on_disk = dest.is_file()
+        rows.append(
+            {
+                "commentId": comment_id,
+                "documentId": document_id,
+                "fileName": dest.name,
+                "localPath": csv_local_path("attachments", folder, dest.name),
+                "format": fmt.get("format") or "",
+                "sourceUrl": fmt.get("fileUrl") or "",
+                "downloaded": "yes" if on_disk else "no",
+                "fileSizeBytes": file_size_bytes(fmt, dest),
+            }
+        )
+    return rows
+
+
+def rebuild_csv_from_raw(out_dir: Path) -> list[dict[str, Any]]:
+    """Rewrite comments.csv and attachments.csv from raw JSON plus files on disk."""
+    rows: list[dict[str, Any]] = []
+    attachment_rows: list[dict[str, Any]] = []
     raw_dir = out_dir / "raw"
     if not raw_dir.exists():
         return rows
     for fp in sorted(raw_dir.glob("*.json")):
         detail = json.loads(fp.read_text(encoding="utf-8"))
-        rows.append(comment_row(detail, len(collect_attachments(detail))))
-    write_csv(out_dir / "comments.csv", rows)
+        planned = attachment_rows_for(detail, out_dir)
+        attachment_rows.extend(planned)
+        downloaded = [row["localPath"] for row in planned if row["downloaded"] == "yes"]
+        rows.append(comment_row(detail, downloaded))
+    write_csv(out_dir / "comments.csv", rows, CSV_COLUMNS)
+    write_csv(out_dir / "attachments.csv", attachment_rows, ATTACHMENT_CSV_COLUMNS)
     return rows
 
 
@@ -956,21 +1054,15 @@ def run(args: argparse.Namespace, client: RegulationsClient) -> int:
             continue
         if args.max_attachments is not None and attachments_downloaded >= args.max_attachments:
             continue
-        files = collect_attachments(detail)
-        dest_dir = attach_root / safe_filename(cid)
-        used_names: set[str] = set()
-        for index, fmt in enumerate(files, start=1):
+        for fmt, dest in assign_attachment_destinations(
+            cid, collect_attachments(detail), attach_root
+        ):
             if args.max_attachments is not None and attachments_downloaded >= args.max_attachments:
                 break
             url = fmt.get("fileUrl")
             if not url:
                 continue
-            chosen = unique_filename(attachment_basename(fmt, index), used_names)
-            dest = destination_path(dest_dir, chosen)
-            if dest.name.lower() in used_names:
-                dest = destination_path(dest_dir, unique_filename(dest.name, used_names))
-            used_names.add(dest.name.lower())
-            if dest.exists():
+            if dest.is_file():
                 log.info("Skip existing attachment %s", dest)
                 continue
             log.info("Downloading attachment %s -> %s", url, dest)
@@ -993,6 +1085,7 @@ def run(args: argparse.Namespace, client: RegulationsClient) -> int:
         client.last_limit,
     )
     log.info("CSV: %s", out_dir / "comments.csv")
+    log.info("CSV: %s", out_dir / "attachments.csv")
     return 0
 
 

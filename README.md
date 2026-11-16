@@ -58,7 +58,7 @@ python pull_docket_comments.py --docket FDA-2025-N-3262
 python pull_docket_comments.py --docket FDA-2025-N-3262 --all-documents
 ```
 
-Output goes to `out-FDA-2025-N-3262` (the document’s docket id, or `--docket` when you pass it). `comments.csv` is UTF-8 with a BOM so Excel opens it correctly.
+Output goes to `out-FDA-2025-N-3262` (the document’s docket id, or `--docket` when you pass it). `comments.csv` and `attachments.csv` are UTF-8 with a BOM so Excel opens them correctly.
 
 ## Command Prompt
 
@@ -118,11 +118,26 @@ The run is **resumable**. Comment JSON already under `raw/` is not fetched again
   documents.json
   comment_counts.json          # one totalElements per selected document
   comments.csv                  # UTF-8 BOM, one row per saved comment
+  attachments.csv               # UTF-8 BOM, one row per attachment file
   raw/<commentId>.json
   attachments/<commentId>/...
 ```
 
-`comments.csv` columns: `id`, `documentId` (parent document / `commentOnDocumentId`), `title`, `postedDate`, `receiveDate`, `firstName`, `lastName`, `organization`, `comment`, `attachmentCount`.
+`comments.csv` columns: `id`, `documentId` (parent document / `commentOnDocumentId`), `title`, `postedDate`, `receiveDate`, `firstName`, `lastName`, `organization`, `comment`, `attachmentCount`, `attachmentFiles`.
+
+`attachmentCount` is how many attachment files the comment detail lists. `attachmentFiles` is the local paths of the files that are actually in the output folder, separated by `; `. It is empty when none of them were saved.
+
+`attachments.csv` columns: `commentId`, `documentId`, `fileName`, `localPath`, `format`, `sourceUrl`, `downloaded`, `fileSizeBytes`.
+
+- `documentId` is the rule the comment is on (the same value as `comments.csv` `documentId`).
+- `localPath` is relative to the output folder and **always uses backslashes**, for example `attachments\FDA-2025-N-3262-0001-0001\letter.pdf`, so Excel on Windows can open it even if this script ran elsewhere.
+- `downloaded` is `yes` or `no`. A file already in `attachments\<commentId>\` counts as `yes` on a later run. Failed downloads and files skipped because of `--max-attachments` are still listed, with `downloaded` `no`.
+- `fileSizeBytes` is the API `size` when the detail includes it, otherwise the size of the file on disk, otherwise blank.
+- `fileName` is the saved name inside that comment’s folder.
+
+Both CSVs are rebuilt from `raw/*.json` at the end of every run, including a resume. Paths in the CSVs match the files on disk.
+
+In Excel, `comments.csv` `id`, `attachments.csv` `commentId`, and the folder name under `attachments` are the same comment id. Filter `attachments.csv` on `commentId` to see that comment’s files. `attachmentFiles` is the `localPath` values for the rows where `downloaded` is `yes`.
 
 File names are rewritten so Windows accepts them (`:` `*` `?` `"` `<` `>` `|` and other illegal characters are removed, reserved names such as `CON` are avoided, and very long paths are shortened).
 
