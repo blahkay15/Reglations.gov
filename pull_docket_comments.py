@@ -37,6 +37,13 @@ import requests
 
 DEFAULT_BASE_URL = "https://api.regulations.gov/v4"
 DEFAULT_KEY = "DEMO_KEY"
+# downloads.regulations.gov returns 403 for non-browser user agents, including
+# python-requests and this script's API user agent. The file host does not use
+# the API key.
+DOWNLOAD_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/130.0 Safari/537.36"
+)
 PAGE_SIZE = 250
 MAX_PAGE = 20
 EASTERN = ZoneInfo("America/New_York")
@@ -243,6 +250,16 @@ class RegulationsClient:
                 "User-Agent": "regs-comments-pull/1.0",
             }
         )
+        # Separate from the API session so file hosts never see X-Api-Key and
+        # file GETs do not consume the API rate-limit budget.
+        self.download_session = requests.Session()
+        self.download_session.headers.clear()
+        self.download_session.headers.update(
+            {
+                "User-Agent": DOWNLOAD_USER_AGENT,
+                "Accept": "*/*",
+            }
+        )
         self.min_remaining = min_remaining
         self.last_limit: int | None = None
         self.last_remaining: int | None = None
@@ -359,12 +376,52 @@ class RegulationsClient:
             )
         return resp.json()
 
+    def _get_file(self, url: str, max_retries: int = 4) -> requests.Response:
+        """GET a file. Does not use the API session, key, or rate-limit throttle."""
+        last_error: Exception | None = None
+        for attempt in range(max_retries):
+            try:
+                resp = self.download_session.get(url, stream=True, timeout=60)
+            except requests.RequestException as exc:
+                last_error = exc
+                sleep = min(30, 2 ** attempt)
+                log.warning("Download error %s; retry in %ss", exc, sleep)
+                time.sleep(sleep)
+                continue
+            log.info(
+                "GET %s -> %s (file download, not counted against the API limit)",
+                resp.url,
+                resp.status_code,
+            )
+            if resp.status_code == 403:
+                resp.close()
+                raise RuntimeError(
+                    f"HTTP 403 downloading {url}. The file host refused the download, "
+                    "so the file was not saved (downloaded=no). "
+                    "Re-run the same command to retry this file. This is not an API rate limit."
+                )
+            if resp.status_code in {500, 502, 503, 504}:
+                resp.close()
+                sleep = min(30, 2 ** attempt)
+                log.warning(
+                    "HTTP %s downloading %s; retry in %ss",
+                    resp.status_code,
+                    url,
+                    sleep,
+                )
+                time.sleep(sleep)
+                continue
+            return resp
+        if last_error:
+            raise last_error
+        raise RuntimeError(f"Exceeded retries downloading {url}")
+
     def download(self, url: str, dest: Path) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
         # Keep the original suffix. Path.with_suffix would replace ".tar.gz"
         # with a single suffix and is easier to get wrong on Windows.
         tmp = dest.parent / (dest.name + ".part")
-        resp = self.request("GET", url, stream=True)
+        resp = self._get_file(url)
         if not resp.ok:
             status = resp.status_code
             resp.close()

@@ -131,7 +131,7 @@ The run is **resumable**. Comment JSON already under `raw/` is not fetched again
 
 - `documentId` is the rule the comment is on (the same value as `comments.csv` `documentId`).
 - `localPath` is relative to the output folder and **always uses backslashes**, for example `attachments\FDA-2025-N-3262-0001-0001\letter.pdf`, so Excel on Windows can open it even if this script ran elsewhere.
-- `downloaded` is `yes` or `no`. A file already in `attachments\<commentId>\` counts as `yes` on a later run. Failed downloads and files skipped because of `--max-attachments` are still listed, with `downloaded` `no`.
+- `downloaded` is `yes` or `no`. A file already in `attachments\<commentId>\` counts as `yes` on a later run. Failed downloads and files skipped because of `--max-attachments` are still listed, with `downloaded` `no`. File downloads use a browser User-Agent and are not sent with the API key; a 403 leaves that file unwritten, and running the same command again retries it.
 - `fileSizeBytes` is the API `size` when the detail includes it, otherwise the size of the file on disk, otherwise blank.
 - `fileName` is the saved name inside that comment’s folder.
 

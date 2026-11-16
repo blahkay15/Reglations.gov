@@ -15,9 +15,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import pull_docket_comments as pull  # noqa: E402
 from pull_docket_comments import (  # noqa: E402
     ATTACHMENT_CSV_COLUMNS,
     CSV_COLUMNS,
+    DOWNLOAD_USER_AGENT,
+    RegulationsClient,
     eastern_filter_value,
     log,
     paginate_collection,
@@ -657,6 +660,75 @@ class RunTests(unittest.TestCase):
         self.assertEqual(attachments[0]["downloaded"], "no")
         self.assertEqual(attachments[0]["fileName"], "my_bad_name.pdf")
         self.assertFalse((out / "attachments" / "C1" / "my_bad_name.pdf").exists())
+
+
+class _FakeFileResponse:
+    def __init__(self, status_code: int, body: bytes = b"") -> None:
+        self.status_code = status_code
+        self.url = "https://downloads.regulations.gov/FDA-2025-N-3262-0001/content.pdf"
+        self._body = body
+        self.closed = False
+        self.ok = 200 <= status_code < 300
+
+    def iter_content(self, chunk_size: int = 0):
+        yield self._body
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class DownloadSessionTests(unittest.TestCase):
+    URL = "https://downloads.regulations.gov/FDA-2025-N-3262-0001/content.pdf"
+
+    def setUp(self) -> None:
+        self.client = RegulationsClient("https://api.regulations.gov/v4", "secret-key")
+        # An API call in this state would sleep on the rate-limit throttle.
+        self.client.last_remaining = 0
+        self.client.min_remaining = 2
+        self.slept: list[float] = []
+        self._original_sleep = pull.time.sleep
+        pull.time.sleep = lambda seconds: self.slept.append(seconds)
+
+    def tearDown(self) -> None:
+        pull.time.sleep = self._original_sleep
+
+    def test_file_session_has_browser_user_agent_and_no_api_key(self) -> None:
+        self.assertEqual(self.client.session.headers["X-Api-Key"], "secret-key")
+        self.assertEqual(self.client.session.headers["User-Agent"], "regs-comments-pull/1.0")
+        self.assertNotIn("X-Api-Key", self.client.download_session.headers)
+        self.assertEqual(self.client.download_session.headers["User-Agent"], DOWNLOAD_USER_AGENT)
+        self.assertNotIn("secret-key", " ".join(self.client.download_session.headers.values()))
+
+    def test_403_is_not_saved_and_a_later_run_retries(self) -> None:
+        calls = {"n": 0}
+
+        def fake_get(url, stream=False, timeout=None):
+            self.assertEqual(url, self.URL)
+            self.assertTrue(stream)
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _FakeFileResponse(403)
+            return _FakeFileResponse(200, b"%PDF-1.4")
+
+        def api_must_not_be_used(*args, **kwargs):
+            raise AssertionError("file download used the API session")
+
+        self.client.download_session.get = fake_get  # type: ignore[method-assign]
+        self.client.session.request = api_must_not_be_used  # type: ignore[method-assign]
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "content.pdf"
+            with self.assertRaises(RuntimeError) as caught:
+                self.client.download(self.URL, dest)
+            self.assertIn("HTTP 403", str(caught.exception))
+            self.assertIn("downloaded=no", str(caught.exception))
+            self.assertIn("Re-run the same command", str(caught.exception))
+            self.assertFalse(dest.exists())
+            self.assertFalse(list(Path(tmp).glob("*.part")))
+            self.client.download(self.URL, dest)
+            self.assertEqual(dest.read_bytes(), b"%PDF-1.4")
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(self.client.request_count, 0)
+        self.assertEqual(self.slept, [])
 
 
 if __name__ == "__main__":
