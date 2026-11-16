@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Python tests
+        run: |
+          python -m pip install -r requirements.txt -r infra/requirements.txt
+          python -m unittest discover -s tests -v
+      - name: Package Lambda and synth
+        env:
+          CDK_DEFAULT_REGION: us-east-1
+        run: |
+          python scripts/package_lambda.py
+          npm install -g aws-cdk@2
+          cdk synth --quiet
+      - name: Frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run lint
+          npm run build
+
+  deploy:
+    needs: test
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Skip until the OIDC role exists
+        id: gate
+        env:
+          ROLE: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+        run: |
+          if [ -z "$ROLE" ]; then
+            echo "AWS_DEPLOY_ROLE_ARN is not set. Deploy is skipped."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.ready == 'true'
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        if: steps.gate.outputs.ready == 'true'
+        with:
+          node-version: "22"
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: steps.gate.outputs.ready == 'true'
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Deploy infrastructure
+        if: steps.gate.outputs.ready == 'true'
+        run: |
+          python -m pip install -r requirements.txt -r infra/requirements.txt
+          python scripts/package_lambda.py
+          npm install -g aws-cdk@2
+          cdk deploy RegsComments --require-approval never
+          # Add -c flags from the README (domain, VPC import, schedule) to this
+          # command once those values exist. Empty variables are intentionally
+          # not passed, so cdk.json defaults stay in effect.
+      - name: Build and publish the worker image
+        if: steps.gate.outputs.ready == 'true'
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          REGION=${{ vars.AWS_REGION }}
+          REPO="$ACCOUNT.dkr.ecr.$REGION.amazonaws.com/regs-comments-worker"
+          aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$ACCOUNT.dkr.ecr.$REGION.amazonaws.com"
+          docker build -t "$REPO:latest" .
+          docker push "$REPO:latest"
+      - name: Publish the frontend
+        if: steps.gate.outputs.ready == 'true'
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+          BUCKET=$(aws cloudformation describe-stacks --stack-name RegsComments --query "Stacks[0].Outputs[?OutputKey=='FrontendBucket'].OutputValue" --output text)
+          DISTRIBUTION=$(aws cloudformation describe-stacks --stack-name RegsComments --query "Stacks[0].Outputs[?OutputKey=='DistributionId'].OutputValue" --output text)
+          CLIENT=$(aws cloudformation describe-stacks --stack-name RegsComments --query "Stacks[0].Outputs[?OutputKey=='UserPoolClientId'].OutputValue" --output text)
+          COGNITO=$(aws cloudformation describe-stacks --stack-name RegsComments --query "Stacks[0].Outputs[?OutputKey=='CognitoHostedUi'].OutputValue" --output text)
+          SITE=$(aws cloudformation describe-stacks --stack-name RegsComments --query "Stacks[0].Outputs[?OutputKey=='SiteUrl'].OutputValue" --output text)
+          printf '{"clientId":"%s","cognitoDomain":"%s","redirectUri":"%s/"}\n' "$CLIENT" "$COGNITO" "${SITE%/}" > dist/config.json
+          aws s3 sync dist/ "s3://$BUCKET" --delete
+          aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION" --paths "/*"

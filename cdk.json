@@ -1,0 +1,11 @@
+{
+  "app": "python3 infra/app.py",
+  "watch": {
+    "include": ["infra/**/*.py", "api/**/*.py", "regs_pull/**/*.py"],
+    "exclude": ["cdk.out", "build", "frontend/node_modules"]
+  },
+  "context": {
+    "vpcMode": "create",
+    "createNat": "false"
+  }
+}
