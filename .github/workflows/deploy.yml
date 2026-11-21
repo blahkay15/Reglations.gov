@@ -1,0 +1,13 @@
+name: Deploy AgentCore demo
+
+# Stub. Blake deploys this dev stack from his laptop first.
+# See docs/agentcore-demo/DEPLOY.md. Do not point this at production.
+on:
+  workflow_dispatch:
+
+jobs:
+  notice:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Not wired yet
+        run: echo "Deploy from a dev SSO session. Instructions are in docs/agentcore-demo/DEPLOY.md."

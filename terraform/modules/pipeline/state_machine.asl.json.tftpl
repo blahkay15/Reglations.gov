@@ -1,0 +1,130 @@
+{
+  "Comment": "Pull comment pages with a low concurrency, then label clusters.",
+  "StartAt": "Plan",
+  "States": {
+    "Plan": {
+      "Type": "Task",
+      "Resource": "${pull_arn}",
+      "Parameters": {
+        "mode": "plan",
+        "jobId.$": "$.jobId",
+        "documentId.$": "$.documentId",
+        "pageSize": ${page_size}
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["RateLimited", "Lambda.TooManyRequestsException", "Lambda.ServiceException", "States.Timeout"],
+          "IntervalSeconds": 60,
+          "BackoffRate": 2,
+          "MaxAttempts": 8
+        }
+      ],
+      "Next": "HasPages"
+    },
+    "HasPages": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.done",
+          "BooleanEquals": true,
+          "Next": "Analyze"
+        }
+      ],
+      "Default": "MapPages"
+    },
+    "MapPages": {
+      "Type": "Map",
+      "ItemsPath": "$.pages",
+      "MaxConcurrency": ${map_max_concurrency},
+      "ItemSelector": {
+        "mode": "page",
+        "page.$": "$$.Map.Item.Value",
+        "jobId.$": "$.jobId",
+        "documentId.$": "$.documentId",
+        "objectId.$": "$.objectId",
+        "windowGe.$": "$.windowGe",
+        "pageSize": ${page_size}
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "INLINE"
+        },
+        "StartAt": "Pull",
+        "States": {
+          "Pull": {
+            "Type": "Task",
+            "Resource": "${pull_arn}",
+            "Retry": [
+              {
+                "ErrorEquals": ["RateLimited", "Lambda.TooManyRequestsException", "Lambda.ServiceException", "States.Timeout"],
+                "IntervalSeconds": 60,
+                "BackoffRate": 2,
+                "MaxAttempts": 8
+              }
+            ],
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.pageResults",
+      "Next": "NextWindow"
+    },
+    "NextWindow": {
+      "Type": "Task",
+      "Resource": "${pull_arn}",
+      "Parameters": {
+        "mode": "next_window",
+        "jobId.$": "$.jobId",
+        "documentId.$": "$.documentId",
+        "objectId.$": "$.objectId",
+        "totalComments.$": "$.totalComments",
+        "loops.$": "$.loops",
+        "pageSize": ${page_size},
+        "windowGe.$": "$.windowGe"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException", "States.Timeout"],
+          "IntervalSeconds": 10,
+          "BackoffRate": 2,
+          "MaxAttempts": 3
+        }
+      ],
+      "Next": "LoopOrFinish"
+    },
+    "LoopOrFinish": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.done",
+          "BooleanEquals": true,
+          "Next": "Analyze"
+        },
+        {
+          "Variable": "$.loops",
+          "NumericGreaterThan": 40,
+          "Next": "Analyze"
+        }
+      ],
+      "Default": "MapPages"
+    },
+    "Analyze": {
+      "Type": "Task",
+      "Resource": "${analyze_arn}",
+      "Parameters": {
+        "jobId.$": "$.jobId",
+        "documentId.$": "$.documentId",
+        "maxLabeledClusters": ${max_labeled_clusters}
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException", "States.Timeout"],
+          "IntervalSeconds": 20,
+          "BackoffRate": 2,
+          "MaxAttempts": 4
+        }
+      ],
+      "End": true
+    }
+  }
+}
