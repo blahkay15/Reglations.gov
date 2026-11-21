@@ -22,3 +22,8 @@ output "account_id" {
   description = "Account this stack was applied in."
   value       = data.aws_caller_identity.current.account_id
 }
+
+output "state_machine_arn" {
+  description = "Step Functions state machine that pulls pages and then analyzes them."
+  value       = module.pipeline.state_machine_arn
+}
