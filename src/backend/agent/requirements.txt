@@ -1,0 +1,5 @@
+# Installed into the ARM64 image. Pin in the work repo once a lockfile exists.
+# VERIFY: bedrock-agentcore and strands-agents versions against the Runtime you deploy.
+bedrock-agentcore
+strands-agents
+boto3
