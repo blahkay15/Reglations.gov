@@ -32,6 +32,12 @@ variable "github_repository" {
   description = "GitHub repo allowed to assume the deploy role, for example blahkay15/Reglations.gov."
 }
 
+variable "github_ref" {
+  type        = string
+  description = "Git ref allowed to assume the deploy role. The apply workflow is still a stub, so this can stay narrow."
+  default     = "refs/heads/main"
+}
+
 variable "tags" {
   type    = map(string)
   default = {}
