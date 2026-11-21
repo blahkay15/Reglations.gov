@@ -25,3 +25,16 @@ module "pipeline" {
   max_labeled_clusters = var.max_labeled_clusters
   tags                 = var.tags
 }
+
+module "agent" {
+  source = "./modules/agent"
+
+  name_prefix       = local.name_prefix
+  aws_region        = var.aws_region
+  table_name        = module.storage.table_name
+  table_arn         = module.storage.table_arn
+  state_machine_arn = module.pipeline.state_machine_arn
+  bedrock_model_id  = var.bedrock_model_id
+  agent_image_tag   = var.agent_image_tag
+  tags              = var.tags
+}

@@ -27,3 +27,13 @@ output "state_machine_arn" {
   description = "Step Functions state machine that pulls pages and then analyzes them."
   value       = module.pipeline.state_machine_arn
 }
+
+output "agent_repository_url" {
+  description = "ECR repository for the ARM64 agent image. Push :latest before the runtime can start."
+  value       = module.agent.repository_url
+}
+
+output "agent_runtime_arn" {
+  description = "Pass this to scripts/invoke_agent.py as AGENT_RUNTIME_ARN."
+  value       = module.agent.agent_runtime_arn
+}
