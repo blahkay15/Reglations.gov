@@ -94,3 +94,10 @@ cdk.out/
 cdk.context.json
 build/
 var/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+terraform/modules/pipeline/.build/

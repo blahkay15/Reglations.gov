@@ -397,3 +397,5 @@ cdk synth
 ```
 
 `cdk synth` does not need AWS credentials when `CDK_DEFAULT_ACCOUNT` is unset. A deploy does.
+
+The dev-only AgentCore demo is separate from this web app. Deploy and tear it down with [docs/agentcore-demo/DEPLOY.md](docs/agentcore-demo/DEPLOY.md).
