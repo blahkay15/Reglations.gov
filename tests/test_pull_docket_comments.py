@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import pull_docket_comments as pull  # noqa: E402
+import regs_pull.engine as pull  # noqa: E402
 from pull_docket_comments import (  # noqa: E402
     ATTACHMENT_CSV_COLUMNS,
     CSV_COLUMNS,
